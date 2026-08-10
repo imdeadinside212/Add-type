@@ -92,20 +92,48 @@ def check_for_update(repo: str = REPO, current_version: str = "0.0.0", timeout: 
     }
 
 
-def download_update(url: str, timeout: int = 30) -> str:
+def download_update(url: str, timeout: int = 30, max_retries: int = 2) -> str:
     """
     Tai file ve thu muc temp, tra ve duong dan file da tai.
+
+    Kiem tra dung luong file tai duoc co khop voi Content-Length ma
+    server bao khong -- neu mang bi ngat giua chung hoac file bi cat
+    (hu file), se bi phat hien va tu dong tai lai (toi da max_retries
+    lan) thay vi am tham dua ra 1 file exe/app khong toan ven, gay loi
+    kho hieu ("missing base_library.zip"...) khi ap dung update.
     """
     local_name = url.split("/")[-1]
     dest = os.path.join(tempfile.gettempdir(), local_name)
 
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with requests.get(url, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                expected_size = int(r.headers.get("Content-Length", 0)) or None
 
-    return dest
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            actual_size = os.path.getsize(dest)
+            if expected_size is not None and actual_size != expected_size:
+                raise IOError(
+                    f"Tai file khong day du: nhan duoc {actual_size} bytes, "
+                    f"can {expected_size} bytes (lan thu {attempt}/{max_retries})"
+                )
+            return dest
+
+        except Exception as e:
+            last_error = e
+            print(f"[updater] Tai that bai (lan {attempt}/{max_retries}): {e}")
+            if os.path.exists(dest):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+
+    raise IOError(f"Khong the tai ban update sau {max_retries} lan thu: {last_error}")
 
 
 def apply_update(new_file_path: str):
@@ -127,8 +155,16 @@ def _apply_update_windows(new_file_path: str):
     """
     PyInstaller --onefile: sys.executable la duong dan file exe dang chay.
     Dung 1 file .bat de doi app thoat, roi ghi de, roi mo lai.
+
+    Kiem tra dung luong file SAU KHI move xong, truoc khi start lai --
+    phong truong hop antivirus (Windows Defender...) khoa/quet file
+    ngay sau khi ghi de, lam file bi thieu/hong ma khong bao loi ro rang
+    (dan den loi kho hieu "missing base_library.zip" luc app moi khoi dong).
+    Neu phat hien sai dung luong, dung lai va bao loi ro rang thay vi
+    mo mot file da hong.
     """
     old_file = sys.executable
+    expected_size = os.path.getsize(new_file_path)
     bat_path = os.path.join(tempfile.gettempdir(), "app_update.bat")
 
     bat_script = f"""@echo off
@@ -139,6 +175,20 @@ if not errorlevel 1 (
     goto wait_loop
 )
 move /Y "{new_file_path}" "{old_file}"
+
+rem Doi them 1 chut de antivirus/OS xu ly xong file moi ghi de truoc
+rem khi kiem tra dung luong va mo lai -- tranh doc phai file dang bi
+rem quet/khoa giua chung.
+timeout /t 2 /nobreak > NUL
+
+for %%A in ("{old_file}") do set ACTUAL_SIZE=%%~zA
+if not "%ACTUAL_SIZE%"=="{expected_size}" (
+    echo Canh bao: file cap nhat co ve khong day du ^(mong doi {expected_size} bytes, thuc te %ACTUAL_SIZE% bytes^).
+    echo Co the do phan mem diet virus da can thiep. Vui long tai lai thu cong tu GitHub Releases.
+    pause
+    exit /b 1
+)
+
 start "" "{old_file}"
 del "%~f0"
 """
