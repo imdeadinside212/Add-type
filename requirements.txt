@@ -1,0 +1,13 @@
+# Thu vien cho phan updater.py (kiem tra/tai ban cap nhat)
+requests
+
+# Thu vien cho Tab 1: Batch Text Placer (giao tiep voi Photoshop qua COM)
+# Chi co tren Windows -- dieu kien sys_platform de build Mac khong bi loi
+pywin32; sys_platform == "win32"
+
+# Thu vien cho Tab 1: dieu khien Chrome/Edge de doc file HTML/MHTML da luu
+playwright
+
+# Thu vien cho Tab 2: PSD <-> Website Checker
+beautifulsoup4
+psd-tools
