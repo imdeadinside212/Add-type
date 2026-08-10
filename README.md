@@ -1,12 +1,7 @@
 # Add type -- Auto Build + Release + Update (mien phi 100%)
 
 
-## Nhung diem can luu y
+## Note khi cài đặt
 
-- **Windows SmartScreen**: exe chua ky se bi canh bao "Windows protected your PC".
-  Nguoi dung bam "More info" -> "Run anyway" la duoc. Het canh bao hoan toan can
-  mua chung chi code-signing (khong free).
-- **macOS Gatekeeper**: app chua notarize se bi chan "unidentified developer" o
-  **lan cai dat dau tien**. Huong dan nguoi dung chuot phai -> Open thay vi double-click,
-  hoac chay `xattr -cr` mot lan. Tu lan update tu dong thu 2 tro di, `updater.py` da
-  tu chay san `xattr -cr` nen it bi canh bao hon.
+- **Windows SmartScreen**: Exe chưa đăng ký sẽ bị cảnh báo, chỉ cần bấm "more info" -> "Run anyway là ok"
+- **macOS Gatekeeper**: app chưa notarize sẽ bị chặn "unidentified developer" ở lần setup đầu. Khuyến khích xài chuột phải -> Open (Ko double click) vào lần đầu mở file. Mac bóp file app ở ngoài nên lúc mở sẽ hơi lâu, đợi tầm 1-2p là được
