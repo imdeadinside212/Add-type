@@ -22,25 +22,27 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.3.0
 
-      # Windows Defender tren chinh may build cua GitHub Actions doi khi
-      # quet/khoa mot phan file dang duoc PyInstaller ghi ra (dac biet la
-      # base_library.zip ben trong onefile bootloader), lam file exe bi
-      # hong ngay tu luc build -- moi may tai ve chay deu se bi loi thieu
-      # file y het nhau. Loai tru thu muc build ra khoi Defender truoc
-      # khi build de tranh loi nay.
       - name: Exclude workspace from Windows Defender
         shell: powershell
         run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
 
-      - name: Build exe
+      # --onedir thay vi --onefile: chay thang tu thu muc cai dat, khong
+      # con phai tu giai nen vao %TEMP%\_MEI... moi lan mo app nua -- loai
+      # bo hoan toan nhom loi "missing base_library.zip" do antivirus/
+      # phan mem dong bo can thiep vao thu muc tam luc dang chay.
+      - name: Build app folder
         run: |
-          pyinstaller --onefile --windowed --name "Add type" --icon icon.ico --add-data "icon.ico;." main.py
+          pyinstaller --onedir --windowed --name "Add type" --icon icon.ico --add-data "icon.ico;." main.py
+
+      - name: Zip build folder
+        shell: powershell
+        run: Compress-Archive -Path "dist\Add type\*" -DestinationPath "dist\Add type-win.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: "dist/Add type.exe"
+          path: "dist/Add type-win.zip"
 
   build-mac:
     runs-on: macos-latest
@@ -98,7 +100,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/Add type.exe
+            dist/Add type-win.zip
             dist/Add type-mac.zip
           generate_release_notes: true
         env:

@@ -20,6 +20,8 @@ import sys
 import platform
 import subprocess
 import tempfile
+import zipfile
+import shutil
 import requests
 
 # Repo GitHub chua cac ban Release cua app "Add type"
@@ -153,19 +155,38 @@ def apply_update(new_file_path: str):
 
 def _apply_update_windows(new_file_path: str):
     """
-    PyInstaller --onefile: sys.executable la duong dan file exe dang chay.
-    Dung 1 file .bat de doi app thoat, roi ghi de, roi mo lai.
+    new_file_path la 1 file .zip chua toan bo thu muc app moi (PyInstaller
+    --onedir). Giai nen ra thu muc tam, roi dung robocopy (co san tren moi
+    may Windows) de dong bo thu muc cai dat hien tai voi noi dung moi, sau
+    do khoi dong lai app.
 
-    Kiem tra dung luong file SAU KHI move xong, truoc khi start lai --
-    phong truong hop antivirus (Windows Defender...) khoa/quet file
-    ngay sau khi ghi de, lam file bi thieu/hong ma khong bao loi ro rang
-    (dan den loi kho hieu "missing base_library.zip" luc app moi khoi dong).
-    Neu phat hien sai dung luong, dung lai va bao loi ro rang thay vi
-    mo mot file da hong.
+    Chuyen tu --onefile sang --onedir vi kieu --onefile phai tu giai nen
+    lai toan bo vao %TEMP%\\_MEI... moi lan mo app, va thu muc tam nay hay
+    bi phan mem diet virus / phan mem dong bo (OneDrive...) khoa hoac can
+    thiep giua chung, gay loi "missing base_library.zip" rat kho debug.
+    --onedir chay thang tu thu muc cai dat, khong con buoc tu giai nen o
+    moi lan mo app nua nen tranh duoc hoan toan nhom loi nay.
     """
-    old_file = sys.executable
-    expected_size = os.path.getsize(new_file_path)
+    old_exe = sys.executable
+    install_dir = os.path.dirname(old_exe)      # vi du: ...\Add type
+    exe_name = os.path.basename(old_exe)        # vi du: Add type.exe
+
+    extract_dir = os.path.join(tempfile.gettempdir(), "add_type_update_extracted")
+    if os.path.isdir(extract_dir):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    with zipfile.ZipFile(new_file_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    # Neu zip nen ca 1 thu muc con o goc (thay vi cac file nam thang o
+    # goc zip), tim va dung thu muc con do lam nguon.
+    entries = os.listdir(extract_dir)
+    if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+        source_dir = os.path.join(extract_dir, entries[0])
+    else:
+        source_dir = extract_dir
+
     bat_path = os.path.join(tempfile.gettempdir(), "app_update.bat")
+    new_exe_path = os.path.join(install_dir, exe_name)
 
     bat_script = f"""@echo off
 :wait_loop
@@ -174,28 +195,16 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak > NUL
     goto wait_loop
 )
-move /Y "{new_file_path}" "{old_file}"
-
-rem Doi them 1 chut de antivirus/OS xu ly xong file moi ghi de truoc
-rem khi kiem tra dung luong va mo lai -- tranh doc phai file dang bi
-rem quet/khoa giua chung.
-timeout /t 2 /nobreak > NUL
-
-for %%A in ("{old_file}") do set ACTUAL_SIZE=%%~zA
-if not "%ACTUAL_SIZE%"=="{expected_size}" (
-    echo Canh bao: file cap nhat co ve khong day du ^(mong doi {expected_size} bytes, thuc te %ACTUAL_SIZE% bytes^).
-    echo Co the do phan mem diet virus da can thiep. Vui long tai lai thu cong tu GitHub Releases.
-    pause
-    exit /b 1
-)
-
-start "" "{old_file}"
+robocopy "{source_dir}" "{install_dir}" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS
+rmdir /s /q "{extract_dir}" 2>NUL
+start "" "{new_exe_path}"
 del "%~f0"
 """
     with open(bat_path, "w") as f:
         f.write(bat_script)
 
     subprocess.Popen(["cmd", "/c", bat_path], shell=True)
+    sys.exit(0)
     sys.exit(0)
 
 
