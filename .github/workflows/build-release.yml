@@ -22,6 +22,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # Windows Defender tren chinh may build cua GitHub Actions doi khi
+      # quet/khoa mot phan file dang duoc PyInstaller ghi ra (dac biet la
+      # base_library.zip ben trong onefile bootloader), lam file exe bi
+      # hong ngay tu luc build -- moi may tai ve chay deu se bi loi thieu
+      # file y het nhau. Loai tru thu muc build ra khoi Defender truoc
+      # khi build de tranh loi nay.
+      - name: Exclude workspace from Windows Defender
+        shell: powershell
+        run: Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+
       - name: Build exe
         run: |
           pyinstaller --onefile --windowed --name "Add type" --icon icon.ico --add-data "icon.ico;." main.py
