@@ -174,7 +174,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")

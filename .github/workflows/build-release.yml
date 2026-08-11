@@ -20,7 +20,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller==6.3.0
 
       # Windows Defender tren chinh may build cua GitHub Actions doi khi
       # quet/khoa mot phan file dang duoc PyInstaller ghi ra (dac biet la
@@ -55,7 +55,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller==6.3.0
 
       # Dung chung 1 file main.py voi ban Windows -- code da tu re nhanh
       # theo sys.platform ben trong (COM tren Windows, AppleScript tren Mac)
