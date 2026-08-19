@@ -32,7 +32,7 @@ jobs:
       # phan mem dong bo can thiep vao thu muc tam luc dang chay.
       - name: Build app folder
         run: |
-          pyinstaller --onedir --windowed --name "Add type" --icon icon.ico --add-data "icon.ico;." main.py
+          pyinstaller --onedir --windowed --name "Add type" --icon icon.ico --add-data "icon.ico;." --collect-all psd_tools --collect-all playwright --collect-all bs4 main.py
 
       - name: Zip build folder
         shell: powershell
@@ -64,9 +64,9 @@ jobs:
       - name: Build app
         run: |
           if [ -f icon.icns ]; then
-            pyinstaller --onefile --windowed --name "Add type" --icon icon.icns --add-data "icon.icns:." main.py
+            pyinstaller --onefile --windowed --name "Add type" --icon icon.icns --add-data "icon.icns:." --collect-all psd_tools --collect-all playwright --collect-all bs4 main.py
           else
-            pyinstaller --onefile --windowed --name "Add type" main.py
+            pyinstaller --onefile --windowed --name "Add type" --collect-all psd_tools --collect-all playwright --collect-all bs4 main.py
           fi
 
       - name: Zip .app bundle
