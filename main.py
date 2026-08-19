@@ -163,10 +163,8 @@ except ImportError:
 
 try:
     from psd_tools import PSDImage
-    PSD_TOOLS_IMPORT_ERROR = None
-except ImportError as e:
+except ImportError:
     PSDImage = None
-    PSD_TOOLS_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
 try:
     from updater import check_for_update, download_update, apply_update
@@ -3137,6 +3135,23 @@ def extract_website_boxes(path):
         <strong>/<em>/<b>/<i> formatting) ...
         Codes look like "#1", "#2", ... (same as Format B)
 
+    FORMAT D ("editor" canvas overlay boxes -- LOSY-style editor):
+        <div class="editor-box ..." data-id="...">
+          ...
+          <div class="editor-box__label">#B1</div>  (or
+           .editor-box-review__label for a box marked "Proof")
+          ...
+          <div class="box-static-content__prosemirror">
+            <div class="tiptap-content-wrapper">
+              <p class="paragraph">actual translated text</p>
+            </div>
+          </div>
+        </div>
+        Codes look like "#B1", "#B2", ... The SAME box/code commonly
+        appears twice in the DOM (once per rendered "viewer" layer
+        version) with identical text -- harmless, later one just
+        overwrites the earlier with the same content.
+
     Either way, the returned dict keys are normalized to "B<number>"
     (e.g. "B1") so they line up with the PSD layer codes.
     """
@@ -3152,6 +3167,10 @@ def extract_website_boxes(path):
         return boxes
 
     boxes = _extract_format_c(soup)
+    if boxes:
+        return boxes
+
+    boxes = _extract_format_d(soup)
     if boxes:
         return boxes
 
@@ -3242,6 +3261,45 @@ def _extract_format_c(soup):
             continue
         boxes[f"B{code_num}".upper()] = (text, styles)
 
+    return boxes
+
+
+def _extract_format_d(soup):
+    """
+    Handles the ".editor-box" canvas-overlay style (see FORMAT D docstring
+    on extract_website_boxes). Mirrors the same box-selection logic already
+    used by the Batch Text Placer's browser-side JS extractor elsewhere in
+    this file, so the two stay consistent with each other.
+    """
+    boxes = {}
+    # "Proof"-status boxes render with a different class
+    # (.editor-box-review) instead of .editor-box -- select both, or every
+    # box marked "Proof" gets silently skipped.
+    for box in soup.select('.editor-box, .editor-box-review'):
+        # Boxes fixed/turned into a "Proof" review box carry their current
+        # number in .editor-box-review__label, not .editor-box__label --
+        # check both, in DOM order, and take whichever exists.
+        label = box.select_one('.editor-box__label, .editor-box-review__label')
+        if not label:
+            continue
+        code = label.get_text(strip=True).lstrip('#').strip()
+        if not code:
+            continue
+
+        # The actual translated text lives in this specific nested
+        # container -- NOT the box element itself, which also contains
+        # unrelated icon buttons (many wrapped in <i>/<b> tags for their
+        # icon fonts) that would otherwise be misread as italic/bold text
+        # formatting. Fall back to the whole box only if this specific
+        # container is missing (defensive, shouldn't normally happen).
+        text_container = box.select_one('.box-static-content__prosemirror') or box
+        text, styles = _node_to_text_and_styles(text_container)
+        if not text.strip():
+            # Blank textbox -- skip (see note in _extract_format_a).
+            continue
+
+        norm_code = code if code.upper().startswith('B') else f"B{code}"
+        boxes[norm_code.upper()] = (text, styles)
     return boxes
 
 
@@ -4002,14 +4060,11 @@ class CheckerTab(ttk.Frame):
         if PSDImage is None:
             missing.append('psd-tools')
         if missing:
-            detail = ""
-            if PSDImage is None and PSD_TOOLS_IMPORT_ERROR:
-                detail = "\nLoi thuc te: %s" % PSD_TOOLS_IMPORT_ERROR
             ttk.Label(
                 self, style="Card.TLabel", foreground='#B3261E', padding=10,
                 text="Missing required package(s): %s\n"
                      "(this only happens running the .py directly without them installed -- "
-                     "the built .exe already has these bundled in)%s" % (", ".join(missing), detail)
+                     "the built .exe already has these bundled in)" % ", ".join(missing)
             ).pack(fill='x')
 
         top = ttk.Frame(self, style="Card.TFrame", padding=(14, 14, 14, 6))
@@ -4145,13 +4200,10 @@ class CheckerTab(ttk.Frame):
         if PSDImage is None:
             missing.append('psd-tools')
         if missing:
-            detail = ""
-            if PSDImage is None and PSD_TOOLS_IMPORT_ERROR:
-                detail = f"\n\nLoi thuc te khi import psd_tools:\n{PSD_TOOLS_IMPORT_ERROR}"
             messagebox.showerror(
                 "Missing dependency",
-                "This needs: %s\nInstall with:\n    pip install %s%s"
-                % (", ".join(missing), " ".join(missing), detail)
+                "This needs: %s\nInstall with:\n    pip install %s"
+                % (", ".join(missing), " ".join(missing))
             )
             return
 
