@@ -174,7 +174,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.1.1"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -2522,6 +2522,21 @@ def extract_textboxes(source, is_url, output_json_path, log_cb=None, headless=Fa
 
 
 
+def natural_sort_key(name):
+    """
+    "Natural" sort key: splits the string into runs of digits and
+    non-digits, converting the digit runs to int, so embedded numbers
+    compare numerically instead of character-by-character.
+
+    Plain string sorting puts "page140" before "page15" (because '4' <
+    '5' at the 2nd character), which is technically alphabetical but not
+    what anyone means by "sorted order" for filenames like this. This
+    key instead sorts page1, page2, ... page15, page16, ... page140, ...
+    """
+    return [int(chunk) if chunk.isdigit() else chunk.lower()
+            for chunk in re.split(r'(\d+)', name)]
+
+
 def find_web_file(folder):
     """
     Looks for a saved HTML/MHTML file already sitting in the folder.
@@ -2537,7 +2552,7 @@ def find_web_file(folder):
     def sort_key(name):
         ext = os.path.splitext(name)[1].lower()
         # .html/.htm sort before .mhtml/.mht
-        return (0 if ext in (".html", ".htm") else 1, name.lower())
+        return (0 if ext in (".html", ".htm") else 1, natural_sort_key(name))
 
     names.sort(key=sort_key)
     chosen = names[0]
@@ -2562,7 +2577,7 @@ def scan_folder(folder):
 
     image_names = sorted(
         [f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTENSIONS)],
-        key=lambda s: s.lower()
+        key=natural_sort_key
     )
     if not image_names:
         raise ValueError("No .psd/.psb/.tif files found in that folder.")
