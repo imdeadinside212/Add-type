@@ -102,6 +102,7 @@ Manual equivalent:
     themselves -- PyInstaller bundles all of that into the single .exe/.app.
 """
 
+import base64
 import csv
 import difflib
 import email
@@ -112,6 +113,7 @@ import math
 import mimetypes
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -174,7 +176,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -1965,6 +1967,100 @@ def get_extraction_profile_dir():
     return profile_dir
 
 
+def shrink_mhtml(in_path, out_path, scale=0.5, quality=85, max_width=0):
+    """
+    Shrinks the embedded raster images inside a saved .mhtml/.mht file
+    (Chrome/Edge "Webpage, Single File" format), producing a much smaller
+    file that renders with the exact same layout/aspect ratios but uses
+    far less memory for the browser to decode.
+
+    Large saved pages (e.g. long webtoon/manhwa strips with many
+    multi-megapixel-tall images) can be big enough that a 32-bit browser
+    process runs out of memory decoding them all, causing the browser to
+    silently die mid-extraction ("Target page, context or browser has
+    been closed"). This preprocessing step avoids that.
+
+    Safe for this tool's extraction script specifically: SCRIPT_MOI_JS
+    computes box positions as RATIOS of each page's native size, where
+    "native size" is read from the page's own CSS (aspect-ratio) / title
+    attribute metadata -- NOT from the actual decoded pixel dimensions of
+    the loaded image. So shrinking image resolution (aspect ratio
+    preserved exactly) does not change the extracted coordinates.
+
+    Raises on failure (e.g. Pillow not installed, or the file isn't a
+    recognizable MIME-multipart mhtml) -- callers should catch and fall
+    back to using the original file.
+    """
+    from PIL import Image
+
+    def wrap_base64(raw_bytes):
+        b64 = base64.b64encode(raw_bytes)
+        lines = [b64[i:i + 76] for i in range(0, len(b64), 76)]
+        return b"\r\n".join(lines) + b"\r\n"
+
+    def shrink_part(part):
+        header_end = part.find(b'\r\n\r\n')
+        if header_end == -1:
+            return part
+        headers_raw = part[:header_end]
+        body = part[header_end + 4:]
+
+        ctype_m = re.search(rb'Content-Type:\s*([^\r\n;]+)', headers_raw, re.IGNORECASE)
+        if not ctype_m:
+            return part
+        ctype = ctype_m.group(1).strip().lower()
+        if ctype not in (b'image/png', b'image/jpeg', b'image/jpg', b'image/webp'):
+            return part
+
+        enc_m = re.search(rb'Content-Transfer-Encoding:\s*([^\r\n]+)', headers_raw, re.IGNORECASE)
+        if not enc_m or enc_m.group(1).strip().lower() != b'base64':
+            return part
+
+        try:
+            raw_img_bytes = base64.b64decode(body.replace(b'\r\n', b''))
+            img = Image.open(io.BytesIO(raw_img_bytes))
+            img.load()
+        except Exception:
+            return part
+
+        orig_w, orig_h = img.size
+        new_w = max(1, round(orig_w * scale))
+        new_h = max(1, round(orig_h * scale))
+        if max_width and new_w > max_width:
+            r = max_width / new_w
+            new_w = max_width
+            new_h = max(1, round(new_h * r))
+
+        if img.mode in ('RGBA', 'P', 'LA'):
+            img = img.convert('RGB')
+
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        out_buf = io.BytesIO()
+        resized.save(out_buf, format='JPEG', quality=quality, optimize=True)
+
+        new_headers = re.sub(
+            rb'Content-Type:\s*[^\r\n;]+', b'Content-Type: image/jpeg',
+            headers_raw, flags=re.IGNORECASE
+        )
+        return new_headers + b'\r\n\r\n' + wrap_base64(out_buf.getvalue())
+
+    data = open(in_path, 'rb').read()
+    m = re.search(rb'boundary="([^"]+)"', data)
+    if not m:
+        raise RuntimeError("Could not find MIME boundary -- not a recognizable .mhtml file")
+    boundary = b'--' + m.group(1)
+
+    segments = data.split(boundary)
+    out_segments = [shrink_part(seg) for seg in segments]
+    new_data = boundary.join(out_segments)
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, 'wb') as f:
+        f.write(new_data)
+
+
 def unpack_mhtml(mhtml_path, log_cb=None):
     """
     Unpacks a saved .mhtml/.mht file (a MIME multipart/related message, the
@@ -2168,7 +2264,118 @@ def unpack_mhtml(mhtml_path, log_cb=None):
     return out_path
 
 
-def extract_textboxes(source, is_url, output_json_path, log_cb=None, headless=False):
+def _clear_stale_profile_locks(profile_dir, log_cb=None):
+    """
+    Removes Chromium's own "singleton" lock files from the persistent
+    profile directory. These are small marker files Chrome/Edge uses to
+    detect "is another instance already using this profile?" -- if a
+    previous run was killed uncleanly (crash, forced close, the "Target
+    page, context or browser has been closed" failures this tool can hit),
+    a stale lock can be left behind and make EVERY subsequent launch
+    unstable, even though the profile's actual data (cookies, saved
+    login, etc.) is completely fine.
+
+    Deliberately does NOT touch anything else in the profile -- saved
+    logins/cookies live in separate files (Cookies, Login Data, etc.) and
+    are left untouched, so you won't need to log back into the site.
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+    lock_names = ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile")
+    removed = []
+    for name in lock_names:
+        p = os.path.join(profile_dir, name)
+        try:
+            if os.path.exists(p) or os.path.islink(p):
+                os.remove(p)
+                removed.append(name)
+        except Exception as e:
+            log("  (couldn't remove stale lock file %s: %s)" % (name, e))
+    if removed:
+        log("Cleared stale browser lock file(s): " + ", ".join(removed))
+
+
+def _wipe_profile_dir(profile_dir, log_cb=None):
+    """
+    Fully deletes and recreates the persistent extraction browser profile.
+    More aggressive than _clear_stale_profile_locks -- used as a last-
+    resort escalation when lock-clearing alone doesn't resolve repeated
+    "Target page, context or browser has been closed" failures, since
+    that's turned out to sometimes be caused by deeper profile corruption
+    (e.g. a damaged Local Storage/IndexedDB/cache file) rather than just
+    a stale lock. This does clear any saved login for live-URL use --
+    only used as a final fallback, and not needed at all for local
+    saved-file extraction (no login required there).
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+    try:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        log("Fully rebuilt browser profile from scratch (previous profile "
+            "was corrupted). If you use a live URL, you may need to log "
+            "in again once.")
+    except Exception as e:
+        log("  (couldn't fully wipe profile dir: %s)" % e)
+    os.makedirs(profile_dir, exist_ok=True)
+
+
+def extract_textboxes(source, is_url, output_json_path, log_cb=None, headless=False,
+                       max_attempts=2):
+    """
+    Thin retry wrapper around _extract_textboxes_once(). This tool has been
+    prone to Playwright intermittently losing its connection to the
+    browser mid-run ("Target page, context or browser has been closed"),
+    caused by a corrupted persistent profile left behind by a previous
+    unclean shutdown rather than anything wrong with the current run.
+    Rather than requiring you to manually delete/rebuild the browser
+    profile every time that happens, this automatically:
+      1. Tries extraction normally.
+      2. If it fails with that specific "connection dropped" error, fully
+         wipes and rebuilds the browser profile (see _wipe_profile_dir),
+         then retries once. This costs nothing for local saved-file
+         extraction (no login involved); for a live URL you may need to
+         log in again once afterward.
+      3. If it's still failing after that, raises the real error so you
+         see what's actually going on.
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt == 2:
+            log("Retrying extraction (attempt %d/%d) -- rebuilding browser "
+                "profile from scratch ..." % (attempt, max_attempts))
+            _wipe_profile_dir(get_extraction_profile_dir(), log_cb=log)
+        try:
+            return _extract_textboxes_once(
+                source, is_url, output_json_path, log_cb=log_cb, headless=headless
+            )
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            # Only auto-retry the specific flaky "connection dropped"
+            # failure mode -- other errors (bad login, missing file, etc.)
+            # should surface immediately instead of wasting time retrying.
+            if "has been closed" not in msg and "Target page" not in msg and "Target closed" not in msg:
+                raise
+            log("Extraction attempt %d/%d failed: %s" % (attempt, max_attempts, msg))
+
+    raise RuntimeError(
+        "Extraction failed %d times in a row, even after fully rebuilding the "
+        "browser profile.\n\nLast error:\n%s\n\n"
+        "This points to something outside the profile itself -- try fully "
+        "closing Edge/Chrome (check Task Manager for any lingering "
+        "msedge.exe/chrome.exe processes) and running again, or check "
+        "whether antivirus/security software is blocking this tool."
+        % (max_attempts, last_err)
+    )
+
+
+def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headless=False):
     """
     Runs the site's extraction console script against either:
       - a live website (is_url=True, `source` is the URL), or
@@ -2273,9 +2480,21 @@ def extract_textboxes(source, is_url, output_json_path, log_cb=None, headless=Fa
     else:
         local_path = source
         if os.path.splitext(source)[1].lower() in (".mhtml", ".mht"):
+            try:
+                shrunk_path = os.path.join(
+                    tempfile.mkdtemp(prefix="psd-batch-mhtml-shrink-"),
+                    os.path.basename(source)
+                )
+                shrink_mhtml(source, shrunk_path, scale=0.5, quality=85)
+                log("Shrank embedded page images before extraction (reduces "
+                    "memory use / crash risk on large saved pages).")
+                source_for_extraction = shrunk_path
+            except Exception as e:
+                log("  (couldn't pre-shrink mhtml images, using original file: %s)" % e)
+                source_for_extraction = source
             log("Detected .mhtml/.mht file -- unpacking to plain HTML first "
                 "(avoids Chrome's mhtml script-sandbox) ...")
-            local_path = unpack_mhtml(source, log_cb=log)
+            local_path = unpack_mhtml(source_for_extraction, log_cb=log)
         nav_target = Path(local_path).resolve().as_uri()
 
     profile_dir = get_extraction_profile_dir()
