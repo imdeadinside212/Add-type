@@ -176,7 +176,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -485,6 +485,19 @@ def build_plan(files_info, data):
                     "fontRatioLocal": font_ratio_local,
                     "pageLabel": "P" + str(page_idx + 1),
                 })
+
+    # Sort each file's boxes into true top-to-bottom (then left-to-right)
+    # reading order by position, regardless of what order they came out of
+    # the extraction JSON in. That JSON's box order is DOM order from the
+    # translation editor -- normally that matches visual position, but a
+    # box added or edited out of sequence (e.g. a missed line fixed later)
+    # keeps its original DOM position, which silently produces the wrong
+    # order here even though nothing about the *data* looks wrong. Placing
+    # boxes in this sorted order (rather than the JSON's raw order) is what
+    # makes the resulting Photoshop layer stack reliably follow the page's
+    # actual visual order every time, instead of "usually" doing so.
+    for boxes in per_file_boxes:
+        boxes.sort(key=lambda b: (b["yRatioLocal"], b["xRatioLocal"]))
 
     return per_file_boxes
 
@@ -1072,7 +1085,7 @@ try {
   }
 
   var group = null;
-  try { group = doc.layerSets.add(); group.name = 'TR'; applyStrokeStyle(group, STYLE_SCALE_RATIO); }
+  try { group = doc.layerSets.add(); group.name = %(GROUP_NAME)s; applyStrokeStyle(group, STYLE_SCALE_RATIO); }
   catch (ge) { group = null; }
 
   for (var i = 0; i < BOX_LIST.length; i++) {
@@ -1083,6 +1096,36 @@ try {
       result.ok++;
     } catch (err) {
       result.errors.push(entry.pageLabel + ' Box#' + entry.tb.id + ': ' + err.message);
+    }
+  }
+
+  // Three empty organizational folders, added AFTER every text layer so
+  // they land above all of them automatically -- a newly added layer/group
+  // always goes to the very top of its parent, so no special-case
+  // "insert right below the folders" bookkeeping is needed at all.
+  //
+  // IMPORTANT: this is also why they're NOT created up front and used as a
+  // PLACEAFTER/PLACEBEFORE anchor for each text layer instead -- Photoshop's
+  // scripting DOM only supports PLACEBEFORE/PLACEAFTER reliably when the
+  // reference is a plain layer. When the reference is a LayerSet (a group,
+  // like these folders), PLACEAFTER/PLACEBEFORE silently ejects the moved
+  // layer out of the group entirely instead of nesting it next to the
+  // folder -- which is exactly the bug that put text layers as siblings of
+  // the main group instead of inside it. PLACEATBEGINNING/PLACEATEND with a
+  // LayerSet reference (used both here and in placeOneBox above) doesn't
+  // have that problem, which is why that's the only technique used to
+  // interact with a LayerSet by reference anywhere in this script.
+  //
+  // Created bottom-first (Speech, then Narration, then SFX last) so the
+  // final top-to-bottom order in the Layers panel reads SFX / Narration /
+  // Speech, above every text layer.
+  if (group) {
+    try {
+      var speechFolder    = group.layerSets.add(); speechFolder.name    = 'Speech';
+      var narrationFolder = group.layerSets.add(); narrationFolder.name = 'Narration';
+      var sfxFolder       = group.layerSets.add(); sfxFolder.name       = 'SFX';
+    } catch (fe) {
+      result.errors.push('NOTE: could not add the SFX/Narration/Speech folders ("' + fe.message + '").');
     }
   }
 
@@ -1442,14 +1485,19 @@ def _run_with_dialog_watchdog(ps_app, fn):
             watcher.join(timeout=2)
 
 
-def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi):
-    """Resize (if requested) and place text -- a single Photoshop open/close for this file."""
+def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, group_name="TR"):
+    """Resize (if requested) and place text -- a single Photoshop open/close for this file.
+
+    group_name names the layer group the text boxes are placed into
+    (defaults to the old fixed "TR" if the caller doesn't have a detected
+    language code to use instead, e.g. "DE"/"EN"/"FR")."""
     script = JSX_TEMPLATE % {
         "FILE_PATH": js_string(file_path.replace("\\", "/")),
         "DO_RESIZE": "true" if do_resize else "false",
         "RESIZE_W": resize_w if resize_w else 0,
         "RESIZE_DPI": resize_dpi if resize_dpi else 72,
         "BOX_LIST": json.dumps(box_list),
+        "GROUP_NAME": js_string(group_name or "TR"),
     }
     raw = _run_with_dialog_watchdog(ps_app, lambda: ps_app.DoJavaScript(script))
     return parse_result(raw)
@@ -2262,6 +2310,75 @@ def unpack_mhtml(mhtml_path, log_cb=None):
 
     log("Unpacked %d resource file(s)." % len(resources))
     return out_path
+
+
+# 2-letter codes we might plausibly see in the site's own language chip.
+# Used only as a sanity check so an unrelated 2-letter string elsewhere in
+# the breadcrumb can't be mistaken for the language -- add to this set if
+# a new target language shows up.
+KNOWN_LANGUAGE_CODES = {
+    "EN", "KO", "JA", "ZH", "DE", "FR", "ES", "PT", "IT", "VI", "TH",
+    "ID", "MS", "RU", "AR", "HI", "NL", "PL", "TR",
+}
+
+
+def detect_language_code(path):
+    """
+    Reads the 2-letter language chip the site already renders next to the
+    chapter title in its breadcrumb header, e.g.:
+
+        <a class="header__breadcrumb__heading">
+          <span class="chip">DE</span>          <!-- or a .tn-tag chip -->
+          <h1 ...>완벽한 결혼을 거절하는 법</h1>
+        </a>
+
+    This is the site telling you the translation's language directly, so
+    there's no need to run any language-detection model over the box text
+    -- just read the chip. Only elements inside `.header__breadcrumb__heading`
+    are checked (so an unrelated 2-letter string elsewhere on the page can't
+    be picked up by mistake), and the text must match a known language code
+    (see KNOWN_LANGUAGE_CODES) -- this filters out the vendor chip (e.g.
+    "NAVER") and the age-rating chip (e.g. "15", "ALL") that sit right next
+    to it in the same header.
+
+    Returns the uppercase code (e.g. "DE"), or None if it can't be found or
+    confirmed -- callers should fall back to the old fixed "TR" group name
+    in that case.
+    """
+    if BeautifulSoup is None:
+        return None
+    try:
+        if os.path.splitext(path)[1].lower() in (".mhtml", ".mht"):
+            with open(path, "rb") as f:
+                msg = email.message_from_binary_file(f, policy=email_policy.default)
+            html = None
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    raw = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        html = raw.decode(charset)
+                    except (LookupError, UnicodeDecodeError):
+                        html = raw.decode("utf-8", errors="replace")
+                    break
+            if html is None:
+                return None
+        else:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                html = f.read()
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(html, 'html.parser')
+    heading = soup.select_one('.header__breadcrumb__heading')
+    if heading is None:
+        return None
+
+    for el in heading.find_all(['span', 'div']):
+        text = el.get_text(strip=True).upper()
+        if text in KNOWN_LANGUAGE_CODES:
+            return text
+    return None
 
 
 def _clear_stale_profile_locks(profile_dir, log_cb=None):
@@ -3100,6 +3217,25 @@ class PlacerTab(ttk.Frame):
                 self.after(0, lambda: self._log("\nStopped before processing started."))
                 return
 
+            # ── Step 1b: detect the translation's language from the site's
+            #     own breadcrumb chip (e.g. "DE"), so the Photoshop group can
+            #     be named after it instead of the fixed "TR". Only possible
+            #     when a saved HTML/MHTML file was actually given this run --
+            #     falls back to "TR" (old behavior) otherwise or if the chip
+            #     isn't found. ─────────────────────────────────────────────
+            group_name = "TR"
+            if do_extract:
+                detected = detect_language_code(source)
+                if detected:
+                    group_name = detected
+                    self.after(0, lambda c=detected: self._log(
+                        "Detected language chip on the page: %s -- Photoshop group will be named \"%s\" instead of \"TR\"." % (c, c)
+                    ))
+                else:
+                    self.after(0, lambda: self._log(
+                        "Could not find a recognizable language chip on the page -- group will be named \"TR\" as before."
+                    ))
+
             # ── Step 2: build the placement plan. This needs no resize size
             #     at all (predicted or real) -- it works entirely in each
             #     file's original dimensions, which are scale-invariant, so
@@ -3182,7 +3318,7 @@ class PlacerTab(ttk.Frame):
                     "Processing %d/%d: %s ..." % (i + 1, len(self._files_info), f["name"])
                 ))
                 try:
-                    result = run_one_file(ps_app, f["path"], box_list, do_resize, resize_width, resize_dpi)
+                    result = run_one_file(ps_app, f["path"], box_list, do_resize, resize_width, resize_dpi, group_name)
                 except Exception as e:
                     result = {"ok": 0, "total": len(box_list), "errors": [str(e)]}
 
