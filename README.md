@@ -1,4 +1,4 @@
-# Add type -- Auto Build + Release + Update (mien phi 100%)
+# Add type
 
 
 ## Note khi cài đặt
