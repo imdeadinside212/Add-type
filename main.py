@@ -176,7 +176,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -870,9 +870,103 @@ function rasterizeScalableFilterLayers(doc, notes) {
   // "changed" filter to worry about; it'll just see the original
   // (still hidden, still live) and the already-rasterized duplicate
   // (no longer LayerKind.SMARTOBJECT, so it's skipped automatically).
+  // ---- clipping-mask helpers -----------------------------------------
+  // A layer that is "clipped" (Create Clipping Mask) is tied to the
+  // nearest un-clipped layer BELOW it, its clipping base. If the base is a
+  // Smart Object we duplicate for baking, the duplicate must take over as
+  // that base -- sitting in the exact same stack slot -- and every layer
+  // that was clipped to the original must stay clipped. Photoshop's
+  // duplicate() does not reliably preserve this, so the clip chain is
+  // recorded before duplicating and re-applied afterwards.
+  function sameLayer(a, b) {
+    try { return a.id === b.id; } catch (e) { return a === b; }
+  }
+
+  function indexInParent(layer) {
+    var sibs = layer.parent.layers;   // index 0 = top of the stack
+    for (var i = 0; i < sibs.length; i++) {
+      if (sameLayer(sibs[i], layer)) return i;
+    }
+    return -1;
+  }
+
+  function isClipped(layer) {
+    try {
+      app.activeDocument.activeLayer = layer;
+      var ref = new ActionReference();
+      ref.putProperty(cID('Prpr'), cID('Grup'));
+      ref.putEnumerated(cID('Lyr '), cID('Ordn'), cID('Trgt'));
+      var d = executeActionGet(ref);
+      if (d.hasKey(cID('Grup'))) return d.getBoolean(cID('Grup'));
+    } catch (e) {}
+    try { return layer.grouped === true; } catch (e2) {}
+    return false;
+  }
+
+  function setClipped(layer, want) {
+    if (isClipped(layer) === want) return;
+    try {
+      layer.grouped = want;
+      if (isClipped(layer) === want) return;
+    } catch (e) {}
+    // Action Manager fallback: Create Clipping Mask / Release Clipping Mask
+    app.activeDocument.activeLayer = layer;
+    var d = new ActionDescriptor();
+    var r = new ActionReference();
+    r.putEnumerated(cID('Lyr '), cID('Ordn'), cID('Trgt'));
+    d.putReference(cID('null'), r);
+    executeAction(want ? cID('GrpL') : sID('ungroup'), d, DialogModes.NO);
+  }
+
+  // Layers stacked directly above `layer` that are clipped (i.e. the
+  // layers that are clipped onto `layer`, or onto the same base as it).
+  function getClipChainAbove(layer) {
+    var chain = [];
+    var idx = indexInParent(layer);
+    if (idx <= 0) return chain;
+    var sibs = layer.parent.layers;
+    for (var j = idx - 1; j >= 0; j--) {
+      if (!isClipped(sibs[j])) break;
+      chain.push(sibs[j]);
+    }
+    return chain;
+  }
+
+  // Duplicates `layer` directly above itself, hides + renames the
+  // original underneath (so it's obviously the untouched, still-live
+  // Smart Object if anyone opens the file later), and rasterizes only
+  // the duplicate. The duplicate -- flat pixels, correctly baking in
+  // whatever the blur currently looks like -- is what the canvas
+  // resize right after this function scales along with everything
+  // else. Nothing about the original Smart Object's filter is ever
+  // touched, so re-running this on the same file later won't find a
+  // "changed" filter to worry about; it'll just see the original
+  // (still hidden, still live) and the already-rasterized duplicate
+  // (no longer LayerKind.SMARTOBJECT, so it's skipped automatically).
+  //
+  // Clipping masks: the duplicate is kept in the same slot (directly
+  // above the original, below any layers clipped to it), takes over the
+  // original's own clipped/un-clipped state, and every layer that was
+  // clipped onto the original is re-clipped onto the duplicate -- so the
+  // visible result keeps the same position and the same mask as before.
   function duplicateHideAndRasterize(layer, nm) {
+    var wasClipped = false;
+    var chain = [];
+    try { wasClipped = isClipped(layer); } catch (eC1) {}
+    try { chain = getClipChainAbove(layer); } catch (eC2) {}
+
     var dup = layer.duplicate(layer, ElementPlacement.PLACEBEFORE);
     dup.name = nm;
+
+    // Make sure the duplicate really sits directly above the original
+    // (and so below the clipped layers), not somewhere else in the stack.
+    try {
+      var di = indexInParent(dup), oi = indexInParent(layer);
+      if (di >= 0 && oi >= 0 && oi !== di + 1) {
+        dup.move(layer, ElementPlacement.PLACEBEFORE);
+      }
+    } catch (eMv) {}
+
     // Photoshop's duplicate() does not reliably mirror the source
     // layer's visibility onto the new copy -- explicitly force it on so
     // this never silently depends on that behavior.
@@ -883,6 +977,12 @@ function rasterizeScalableFilterLayers(doc, notes) {
     // kind of visibility drift this whole fix is guarding against.
     layer.visible = false;
     dup.rasterize(RasterizeType.ENTIRELAYER);
+
+    // Re-apply the clipping state recorded above.
+    try { setClipped(dup, wasClipped); } catch (eC3) {}
+    for (var ck = 0; ck < chain.length; ck++) {
+      try { setClipped(chain[ck], true); } catch (eC4) {}
+    }
     return dup;
   }
 
@@ -3354,24 +3454,36 @@ class PlacerTab(ttk.Frame):
 
 # ══════════════════════════════════════════════════════════════════
 #  TAB 2: PSD <-> WEBSITE TEXT CHECKER
-#  (merged from check_type.py -- compares "#Bx"/"#x" translation boxes
-#  on a saved website export against "Bx_..." Photoshop text layers)
+#  (merged from check_type.py -- compares "#x" (or legacy "#Bx") translation
+#  boxes on a saved website export against "x_..." Photoshop text layers)
 # ══════════════════════════════════════════════════════════════════
 
 CODE_PATTERNS = [
-    re.compile(r'^B(\d+)_', re.IGNORECASE),        # e.g. "B1_arien !"
+    re.compile(r'^(\d+)_'),                        # e.g. "1_arien !"  (current)
+    re.compile(r'^B(\d+)_', re.IGNORECASE),        # e.g. "B1_arien !" (legacy)
     re.compile(r'^DKI:\s*(\d+)_', re.IGNORECASE),  # e.g. "DKI: 112_..."
 ]
 
 
+def _normalize_box_code(raw):
+    """Normalizes a box code from the website into the plain-number string
+    used as the matching key (e.g. "#12" -> "12"). A leading "B" (old
+    website numbering, "#B12") is tolerated and dropped, so both the old
+    and the new website exports line up with "12_..." PSD layers.
+    Returns '' if no number is found."""
+    m = re.search(r'(\d+)', str(raw))
+    return str(int(m.group(1))) if m else ''
+
+
 def _match_layer_code(layer_name):
     """Tries each known layer-naming convention in turn. Returns the
-    normalized code (e.g. "B112") or None if nothing matches."""
+    normalized code (plain number string, e.g. "112") or None if
+    nothing matches."""
     name = layer_name.strip()
     for pattern in CODE_PATTERNS:
         m = pattern.match(name)
         if m:
-            return f"B{m.group(1)}".upper()
+            return str(int(m.group(1)))
     return None
 
 CHECKER_HTML_EXTS = {'.mhtml', '.html', '.htm'}
@@ -3522,8 +3634,9 @@ def extract_website_boxes(path):
         version) with identical text -- harmless, later one just
         overwrites the earlier with the same content.
 
-    Either way, the returned dict keys are normalized to "B<number>"
-    (e.g. "B1") so they line up with the PSD layer codes.
+    Either way, the returned dict keys are normalized to the plain number
+    string (e.g. "1"; an old-style "#B1" also becomes "1") so they line up
+    with the PSD layer codes ("1_...", legacy "B1_..." also accepted).
     """
     html = load_html_text(path)
     soup = BeautifulSoup(html, 'html.parser')
@@ -3556,7 +3669,7 @@ def _extract_format_a(soup):
         header = item.select_one('.panel__body__list__item__inner__header__id')
         if not header:
             continue
-        code = header.get_text(strip=True).lstrip('#').strip()
+        code = _normalize_box_code(header.get_text(strip=True))
         if not code:
             continue
 
@@ -3569,8 +3682,7 @@ def _extract_format_a(soup):
             # matching) doesn't throw off the top-to-bottom pairing either.
             continue
 
-        norm_code = code if code.upper().startswith('B') else f"B{code}"
-        boxes[norm_code.upper()] = (text, styles)
+        boxes[code] = (text, styles)
     return boxes
 
 
@@ -3596,7 +3708,10 @@ def _extract_format_b(soup):
             # Blank textbox -- skip (see note in _extract_format_a).
             continue
 
-        boxes[f"B{box_id}".upper()] = (text, styles)
+        code = _normalize_box_code(box_id)
+        if not code:
+            continue
+        boxes[code] = (text, styles)
     return boxes
 
 
@@ -3629,7 +3744,7 @@ def _extract_format_c(soup):
         if not text.strip():
             # Blank textbox -- skip (see note in _extract_format_a).
             continue
-        boxes[f"B{code_num}".upper()] = (text, styles)
+        boxes[_normalize_box_code(code_num)] = (text, styles)
 
     return boxes
 
@@ -3652,7 +3767,7 @@ def _extract_format_d(soup):
         label = box.select_one('.editor-box__label, .editor-box-review__label')
         if not label:
             continue
-        code = label.get_text(strip=True).lstrip('#').strip()
+        code = _normalize_box_code(label.get_text(strip=True))
         if not code:
             continue
 
@@ -3668,8 +3783,7 @@ def _extract_format_d(soup):
             # Blank textbox -- skip (see note in _extract_format_a).
             continue
 
-        norm_code = code if code.upper().startswith('B') else f"B{code}"
-        boxes[norm_code.upper()] = (text, styles)
+        boxes[code] = (text, styles)
     return boxes
 
 
