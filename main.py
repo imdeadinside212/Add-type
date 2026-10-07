@@ -119,6 +119,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from email import policy as email_policy
 from pathlib import Path
@@ -176,7 +177,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -1199,7 +1200,7 @@ try {
     }
   }
 
-  // Three empty organizational folders, added AFTER every text layer so
+  // Four empty organizational folders, added AFTER every text layer so
   // they land above all of them automatically -- a newly added layer/group
   // always goes to the very top of its parent, so no special-case
   // "insert right below the folders" bookkeeping is needed at all.
@@ -1216,17 +1217,45 @@ try {
   // have that problem, which is why that's the only technique used to
   // interact with a LayerSet by reference anywhere in this script.
   //
-  // Created bottom-first (Speech, then Narration, then SFX last) so the
-  // final top-to-bottom order in the Layers panel reads SFX / Narration /
-  // Speech, above every text layer.
+  // Created bottom-first (Note/BG, then Speech, then Narration, then SFX
+  // last) so the final top-to-bottom order in the Layers panel reads
+  // SFX / Narration / Speech / Note/BG, above every text layer.
   if (group) {
     try {
+      var noteBgFolder    = group.layerSets.add(); noteBgFolder.name    = 'Note/BG';
       var speechFolder    = group.layerSets.add(); speechFolder.name    = 'Speech';
       var narrationFolder = group.layerSets.add(); narrationFolder.name = 'Narration';
       var sfxFolder       = group.layerSets.add(); sfxFolder.name       = 'SFX';
     } catch (fe) {
-      result.errors.push('NOTE: could not add the SFX/Narration/Speech folders ("' + fe.message + '").');
+      result.errors.push('NOTE: could not add the SFX/Narration/Speech/Note-BG folders ("' + fe.message + '").');
     }
+  }
+
+  // Empty "BG" group sent to the very bottom of the whole document (same
+  // result as Ctrl+Shift+[ "Send to Back"). Photoshop never lets anything
+  // sit below a locked Background layer -- Ctrl+Shift+[ in that case just
+  // puts the layer right above it -- so mirror that: if the bottom layer
+  // is the Background layer, go directly above it; otherwise go to the
+  // very end of the document.
+  try {
+    var bgGroup = doc.layerSets.add(); bgGroup.name = 'BG';
+    var bottomLayer = doc.layers[doc.layers.length - 1];
+    var bottomIsBackground = false;
+    try { bottomIsBackground = (bottomLayer.typename === 'ArtLayer' && bottomLayer.isBackgroundLayer); }
+    catch (bbe) { bottomIsBackground = false; }
+    if (bottomIsBackground) {
+      bgGroup.move(bottomLayer, ElementPlacement.PLACEBEFORE);
+    } else {
+      bgGroup.move(doc, ElementPlacement.PLACEATEND);
+    }
+  } catch (bge) {
+    result.errors.push('NOTE: could not add the BG group at the bottom ("' + bge.message + '").');
+  }
+
+  // Leave the main (top) group as the selected layer, so the file opens
+  // with it selected instead of the BG group that was just created.
+  if (group) {
+    try { doc.activeLayer = group; } catch (sle) {}
   }
 
   app.preferences.rulerUnits = prevRuler;
@@ -2692,16 +2721,32 @@ def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headl
             }
         """ % max_wait_ms, timeout=max_wait_ms + 10000)
 
+    # Every temp folder this run creates is tracked here and deleted when
+    # the run ends (success OR failure), so nothing is left behind.
+    temp_dirs = []
+
+    def _cleanup_temp_dirs():
+        for d in temp_dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        del temp_dirs[:]
+
+    # Dedicated folder for the browser's textboxes.json download, so it
+    # never lands in (or lingers in) the user's real Downloads folder.
+    download_dir = tempfile.mkdtemp(prefix="psd-batch-dl-")
+    temp_dirs.append(download_dir)
+
     if is_url:
         nav_target = source
     else:
         local_path = source
         if os.path.splitext(source)[1].lower() in (".mhtml", ".mht"):
             try:
-                shrunk_path = os.path.join(
-                    tempfile.mkdtemp(prefix="psd-batch-mhtml-shrink-"),
-                    os.path.basename(source)
-                )
+                shrink_dir = tempfile.mkdtemp(prefix="psd-batch-mhtml-shrink-")
+                temp_dirs.append(shrink_dir)
+                shrunk_path = os.path.join(shrink_dir, os.path.basename(source))
                 shrink_mhtml(source, shrunk_path, scale=0.5, quality=85)
                 log("Shrank embedded page images before extraction (reduces "
                     "memory use / crash risk on large saved pages).")
@@ -2711,7 +2756,12 @@ def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headl
                 source_for_extraction = source
             log("Detected .mhtml/.mht file -- unpacking to plain HTML first "
                 "(avoids Chrome's mhtml script-sandbox) ...")
-            local_path = unpack_mhtml(source_for_extraction, log_cb=log)
+            try:
+                local_path = unpack_mhtml(source_for_extraction, log_cb=log)
+            except Exception:
+                _cleanup_temp_dirs()
+                raise
+            temp_dirs.append(os.path.dirname(local_path))
         nav_target = Path(local_path).resolve().as_uri()
 
     profile_dir = get_extraction_profile_dir()
@@ -2722,7 +2772,8 @@ def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headl
         for channel in ("chrome", "msedge"):
             try:
                 context = p.chromium.launch_persistent_context(
-                    profile_dir, channel=channel, headless=headless
+                    profile_dir, channel=channel, headless=headless,
+                    downloads_path=download_dir
                 )
                 log("Using browser channel: %s (persistent profile at %s)" % (channel, profile_dir))
                 break
@@ -2730,6 +2781,7 @@ def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headl
                 launch_errors.append("%s: %s" % (channel, e))
 
         if context is None:
+            _cleanup_temp_dirs()
             raise RuntimeError(
                 "Could not launch Chrome or Edge via Playwright.\n\n"
                 "Make sure Google Chrome or Microsoft Edge is installed on "
@@ -2938,23 +2990,56 @@ def _extract_textboxes_once(source, is_url, output_json_path, log_cb=None, headl
 
             log("Running extraction script ...")
 
-            try:
-                with page.expect_download(timeout=30000) as download_info:
-                    page.evaluate(script_text)
-                download = download_info.value
-            except PlaywrightTimeoutError:
+            # Capture the JSON in-page instead of letting the browser download
+            # it. The site script builds a Blob and "downloads" it via a
+            # synthetic <a download> click; with a real Chrome/Edge profile
+            # that leaves a GUID-named .tmp file in the user's Downloads
+            # folder that can't be reliably removed afterwards. So: hook
+            # createObjectURL to grab the Blob, and swallow the synthetic
+            # click so no download ever happens.
+            page.evaluate("""() => {
+                window.__capturedBlob = null;
+                const origCreate = URL.createObjectURL.bind(URL);
+                URL.createObjectURL = function (obj) {
+                    if (obj instanceof Blob) window.__capturedBlob = obj;
+                    return origCreate(obj);
+                };
+                const origClick = HTMLAnchorElement.prototype.click;
+                HTMLAnchorElement.prototype.click = function () {
+                    if (this.download === 'textboxes.json') return;
+                    return origClick.apply(this, arguments);
+                };
+            }""")
+
+            page.evaluate(script_text)
+
+            json_text = None
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                json_text = page.evaluate(
+                    "async () => window.__capturedBlob ? await window.__capturedBlob.text() : null"
+                )
+                if json_text:
+                    break
+                page.wait_for_timeout(300)
+
+            if not json_text:
                 raise RuntimeError(
-                    "No textboxes.json download happened within 30s. This usually means "
+                    "No textboxes.json was produced within 30s. This usually means "
                     "either: the extraction script hit an error (check the [console] lines "
                     "above), or a warning dialog (e.g. duplicate pages) was auto-dismissed. "
                     "Scroll up in the log for details."
                 )
 
-            download.save_as(output_json_path)
+            with open(output_json_path, "w", encoding="utf-8", newline="") as f:
+                f.write(json_text)
             log("Saved: " + output_json_path)
 
         finally:
-            context.close()
+            try:
+                context.close()
+            finally:
+                _cleanup_temp_dirs()
 
 
 
