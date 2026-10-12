@@ -177,7 +177,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -429,8 +429,9 @@ def build_plan(files_info, data):
             for tb in page["textBoxes"]:
                 per_file_boxes[i].append({
                     "tb": tb,
-                    "xRatioLocal": tb["xRatio"],
-                    "yRatioLocal": tb["yRatio"],
+                    # Box CENTER (top-left + half the box size), not top-left.
+                    "xRatioLocal": tb["xRatio"] + tb.get("wRatio", 0) / 2.0,
+                    "yRatioLocal": tb["yRatio"] + tb.get("hRatio", 0) / 2.0,
                     "fontRatioLocal": tb.get("fontSizeRatio", 0),
                     "pageLabel": "P" + str(i + 1),
                 })
@@ -460,8 +461,9 @@ def build_plan(files_info, data):
 
         for page_idx, page in enumerate(data["pages"]):
             for tb in page["textBoxes"]:
-                abs_native_y = tb["yRatioGlobal"] * web_total_h
-                abs_native_x = tb["xRatioGlobal"] * json_native_w
+                # Box CENTER in web-native pixels (top-left + half box size).
+                abs_native_y = (tb["yRatioGlobal"] + tb.get("hRatioGlobal", 0) / 2.0) * web_total_h
+                abs_native_x = (tb["xRatioGlobal"] + tb.get("wRatioGlobal", 0) / 2.0) * json_native_w
                 abs_orig_ps_y = abs_native_y * design_scale
 
                 target_idx = n_files - 1
@@ -617,6 +619,7 @@ function placeOneBox(doc, tb, xRatio, yRatio, fontSizeRatio, pageLabel, group) {
   var docH   = doc.height.as('px');
   var docDPI = doc.resolution;
 
+  // xRatio/yRatio are the CENTER of the original box (not its top-left).
   var targetX = xRatio * docW;
   var targetY = yRatio * docH;
 
@@ -629,7 +632,6 @@ function placeOneBox(doc, tb, xRatio, yRatio, fontSizeRatio, pageLabel, group) {
   }
 
   var fontPx    = fontPt * docDPI / 72;
-  var yBaseline = targetY + fontPx * 0.72;
 
   var psText = tb.text.replace(/\n/g, '\r');
 
@@ -653,10 +655,13 @@ function placeOneBox(doc, tb, xRatio, yRatio, fontSizeRatio, pageLabel, group) {
   else if (align === 'justify') { tl.justification = Justification.FULLJUSTIFYLASTLEFT; }
   else                          { tl.justification = Justification.CENTER; }
 
-  var cur = tl.position;
+  // Move the text so the CENTER of its bounds sits on the box center.
+  var bnds = layer.bounds;
+  var curCx = (bnds[0].as('px') + bnds[2].as('px')) / 2;
+  var curCy = (bnds[1].as('px') + bnds[3].as('px')) / 2;
   layer.translate(
-    new UnitValue(targetX   - cur[0].as('px'), 'px'),
-    new UnitValue(yBaseline - cur[1].as('px'), 'px')
+    new UnitValue(targetX - curCx, 'px'),
+    new UnitValue(targetY - curCy, 'px')
   );
 
   if (tb.opacity !== undefined && tb.opacity < 1) {
@@ -1073,6 +1078,57 @@ function rasterizeScalableFilterLayers(doc, notes) {
   }
 }
 
+// ---- collapse / read back a group's open-closed state -------------------
+// "layerSectionExpanded" is the Action Manager property behind the little
+// arrow next to a group in the Layers panel (true = open, false = closed).
+function getGroupExpanded(layerId) {
+  try {
+    var ref = new ActionReference();
+    ref.putProperty(charIDToTypeID('Prpr'), stringIDToTypeID('layerSectionExpanded'));
+    ref.putIdentifier(charIDToTypeID('Lyr '), layerId);
+    var d = executeActionGet(ref);
+    return d.getBoolean(stringIDToTypeID('layerSectionExpanded'));
+  } catch (e) { return null; }   // null = couldn't read it
+}
+
+function setGroupExpanded(layerId, expanded) {
+  var cID = charIDToTypeID, sID = stringIDToTypeID;
+  // Variant A: target by layer id (doesn't depend on what's selected).
+  try {
+    var refA = new ActionReference();
+    refA.putIdentifier(cID('Lyr '), layerId);
+    var dA = new ActionDescriptor();
+    dA.putReference(cID('null'), refA);
+    var propsA = new ActionDescriptor();
+    propsA.putBoolean(sID('layerSectionExpanded'), expanded);
+    dA.putObject(cID('T   '), cID('Lyr '), propsA);
+    executeAction(cID('setd'), dA, DialogModes.NO);
+    if (getGroupExpanded(layerId) === expanded) return true;
+  } catch (eA) {}
+  // Variant B: target the property directly.
+  try {
+    var refB = new ActionReference();
+    refB.putProperty(cID('Prpr'), sID('layerSectionExpanded'));
+    refB.putIdentifier(cID('Lyr '), layerId);
+    var dB = new ActionDescriptor();
+    dB.putReference(cID('null'), refB);
+    dB.putBoolean(sID('layerSectionExpanded'), expanded);
+    executeAction(cID('setd'), dB, DialogModes.NO);
+    if (getGroupExpanded(layerId) === expanded) return true;
+  } catch (eB) {}
+  // Variant C: Photoshop's own "Collapse All Groups" command (the same one
+  // as the Layers panel menu). Only meaningful when closing.
+  if (!expanded) {
+    try {
+      executeAction(sID('collapseAllGroupsEvent'), new ActionDescriptor(), DialogModes.NO);
+    } catch (eC) {}
+    // If the state can't be read back (null), assume the command worked
+    // rather than reporting a false failure; only a confirmed "still open" fails.
+    return getGroupExpanded(layerId) !== true;
+  }
+  return false;
+}
+
 // ---- injected per-file parameters ----
 var FILE_PATH   = %(FILE_PATH)s;
 var DO_RESIZE   = %(DO_RESIZE)s;
@@ -1237,8 +1293,9 @@ try {
   // puts the layer right above it -- so mirror that: if the bottom layer
   // is the Background layer, go directly above it; otherwise go to the
   // very end of the document.
+  var bgGroup = null;
   try {
-    var bgGroup = doc.layerSets.add(); bgGroup.name = 'BG';
+    bgGroup = doc.layerSets.add(); bgGroup.name = 'BG';
     var bottomLayer = doc.layers[doc.layers.length - 1];
     var bottomIsBackground = false;
     try { bottomIsBackground = (bottomLayer.typename === 'ArtLayer' && bottomLayer.isBackgroundLayer); }
@@ -1248,6 +1305,16 @@ try {
     } else {
       bgGroup.move(doc, ElementPlacement.PLACEATEND);
     }
+    // Empty groups can refuse to close, so close it while it holds a
+    // throwaway layer, then delete that layer and lock the group.
+    var tmpLayer = null;
+    try {
+      tmpLayer = doc.artLayers.add();
+      tmpLayer.move(bgGroup, ElementPlacement.PLACEATBEGINNING);
+    } catch (te) { tmpLayer = null; }
+    try { setGroupExpanded(bgGroup.id, false); } catch (ce) {}
+    if (tmpLayer) { try { tmpLayer.remove(); } catch (re) {} }
+    try { bgGroup.allLocked = true; } catch (le) {}
   } catch (bge) {
     result.errors.push('NOTE: could not add the BG group at the bottom ("' + bge.message + '").');
   }
@@ -1256,6 +1323,16 @@ try {
   // with it selected instead of the BG group that was just created.
   if (group) {
     try { doc.activeLayer = group; } catch (sle) {}
+  }
+
+  // Close the BG group's arrow as the very last layer-panel operation, so
+  // nothing after it (selection changes, adding/moving layers) can flip it
+  // back open. It was already locked above; verified by reading it back.
+  if (bgGroup) {
+    var bgClosed = setGroupExpanded(bgGroup.id, false);
+    if (!bgClosed) {
+      result.errors.push('NOTE: could not collapse the BG group (Photoshop kept it open).');
+    }
   }
 
   app.preferences.rulerUnits = prevRuler;
