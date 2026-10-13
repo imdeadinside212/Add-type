@@ -177,7 +177,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -832,6 +832,92 @@ function resizeImageWithScaledStyles(doc, newWidthPx, newHeightPx, dpi, includeI
 // correctly-scaled baked blur, but the original live Smart Object with
 // its editable filter stays in the document (hidden) if anyone needs
 // to go back to it later.
+// ---- final visibility enforcement ----------------------------------------
+// Ids of the Smart Objects that were baked (duplicate + rasterize) and so
+// must END the run hidden, and a visibility snapshot of the whole document
+// taken before anything was touched. enforceVisibility() runs right before
+// saving and puts everything back, whatever step in between flipped it.
+var BAKED_ORIGINAL_IDS = [];
+var PROCESSED_NAME_RE  = / \(original, hidden\)$/;
+
+function _vsIdOf(l) { try { return l.id; } catch (e) { return null; } }
+function _vsIsSet(l) { try { return l.typename === 'LayerSet'; } catch (e) { return false; } }
+
+function _vsSet(id, vis) {
+  var r = new ActionReference();
+  r.putIdentifier(charIDToTypeID('Lyr '), id);
+  var l = new ActionList();
+  l.putReference(r);
+  var d = new ActionDescriptor();
+  d.putList(charIDToTypeID('null'), l);
+  executeAction(charIDToTypeID(vis ? 'Shw ' : 'Hd  '), d, DialogModes.NO);
+}
+
+function _vsGet(id) {
+  try {
+    var r = new ActionReference();
+    r.putProperty(charIDToTypeID('Prpr'), charIDToTypeID('Vsbl'));
+    r.putIdentifier(charIDToTypeID('Lyr '), id);
+    return executeActionGet(r).getBoolean(charIDToTypeID('Vsbl'));
+  } catch (e) { return null; }   // null = layer no longer exists / unreadable
+}
+
+function snapshotAllVisibility(list, map) {
+  for (var i = 0; i < list.length; i++) {
+    var l = list[i], id = _vsIdOf(l);
+    if (id !== null) { var v = _vsGet(id); if (v !== null) map[id] = v; }
+    if (_vsIsSet(l)) snapshotAllVisibility(l.layers, map);
+  }
+  return map;
+}
+
+function _hideProcessedByName(list, hiddenIds) {
+  for (var i = 0; i < list.length; i++) {
+    var l = list[i], id = _vsIdOf(l), nm = '';
+    try { nm = l.name; } catch (e) {}
+    if (id !== null && PROCESSED_NAME_RE.test(nm)) hiddenIds.push(id);
+    if (_vsIsSet(l)) _hideProcessedByName(l.layers, hiddenIds);
+  }
+}
+
+// 1) every layer present before the run gets its original visibility back
+// (so no unrelated Smart Object ends up toggled); 2) every baked original,
+// and any layer named "... (original, hidden)" -- including ones left
+// visible by an earlier buggy run -- is hidden.
+function enforceVisibility(doc, snapshot, notes) {
+  var fixedOthers = 0, fixedOrig = 0;
+  var mustHide = {};
+  for (var a = 0; a < BAKED_ORIGINAL_IDS.length; a++) mustHide[BAKED_ORIGINAL_IDS[a]] = true;
+  var named = [];
+  try { _hideProcessedByName(doc.layers, named); } catch (eN) {}
+  for (var b = 0; b < named.length; b++) mustHide[named[b]] = true;
+
+  if (snapshot) {
+    for (var k in snapshot) {
+      if (!snapshot.hasOwnProperty(k)) continue;
+      var id = parseInt(k, 10);
+      if (mustHide[id]) continue;
+      var now = _vsGet(id);
+      if (now !== null && now !== snapshot[k]) {
+        try { _vsSet(id, snapshot[k]); fixedOthers++; } catch (eS) {}
+      }
+    }
+  }
+  for (var m in mustHide) {
+    if (!mustHide.hasOwnProperty(m)) continue;
+    var mid = parseInt(m, 10);
+    var vis = _vsGet(mid);
+    if (vis === true) {
+      try { _vsSet(mid, false); fixedOrig++; } catch (eH) {}
+    }
+  }
+  if (fixedOrig || fixedOthers) {
+    notes.push('NOTE: visibility check before saving re-hid ' + fixedOrig +
+               ' original Smart Object layer(s) and restored ' + fixedOthers +
+               ' other layer(s) whose visibility had changed.');
+  }
+}
+
 function rasterizeScalableFilterLayers(doc, notes) {
   var sID = stringIDToTypeID, cID = charIDToTypeID;
   var SO_KEY   = sID('smartObject');
@@ -955,41 +1041,128 @@ function rasterizeScalableFilterLayers(doc, notes) {
   // original's own clipped/un-clipped state, and every layer that was
   // clipped onto the original is re-clipped onto the duplicate -- so the
   // visible result keeps the same position and the same mask as before.
-  function duplicateHideAndRasterize(layer, nm) {
-    var wasClipped = false;
-    var chain = [];
-    try { wasClipped = isClipped(layer); } catch (eC1) {}
-    try { chain = getClipChainAbove(layer); } catch (eC2) {}
+  // ---- id-based layer access ------------------------------------------
+  // IMPORTANT: ExtendScript layer objects are effectively positional
+  // references. After duplicate()/move()/rasterize() shift the stack, an
+  // object fetched earlier can silently point at a DIFFERENT layer -- which
+  // is how "hide the original" ended up hiding/showing the wrong layer.
+  // So every step below re-resolves layers from their stable numeric id,
+  // and visibility is changed through Action Manager with an explicit id
+  // (never a toggle, never "whatever is selected").
+  function idOf(l) { try { return l.id; } catch (e) { return null; } }
 
+  function findLayerById(list, id) {
+    for (var i = 0; i < list.length; i++) {
+      var l = list[i];
+      if (idOf(l) === id) return l;
+      var isSet = false;
+      try { isSet = l.typename === 'LayerSet'; } catch (eT) {}
+      if (isSet) {
+        var r = findLayerById(l.layers, id);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+  function byId(id) { return findLayerById(app.activeDocument.layers, id); }
+
+  function setVisibleById(id, vis) {
+    var r = new ActionReference();
+    r.putIdentifier(cID('Lyr '), id);
+    var l = new ActionList();
+    l.putReference(r);
+    var d = new ActionDescriptor();
+    d.putList(cID('null'), l);
+    executeAction(cID(vis ? 'Shw ' : 'Hd  '), d, DialogModes.NO);
+  }
+
+  function isVisibleById(id) {
+    try {
+      var r = new ActionReference();
+      r.putProperty(cID('Prpr'), cID('Vsbl'));
+      r.putIdentifier(cID('Lyr '), id);
+      return executeActionGet(r).getBoolean(cID('Vsbl'));
+    } catch (e) { return null; }
+  }
+
+  // Snapshot of every layer's visibility (id -> bool), taken while the
+  // stack is stable, used to undo any collateral visibility changes.
+  function snapshotVisibility(list, map) {
+    for (var i = 0; i < list.length; i++) {
+      var l = list[i], id = idOf(l);
+      if (id === null) continue;
+      try { map[id] = l.visible; } catch (eV) {}
+      var isSet = false;
+      try { isSet = l.typename === 'LayerSet'; } catch (eT) {}
+      if (isSet) snapshotVisibility(l.layers, map);
+    }
+    return map;
+  }
+  function restoreVisibility(map, skipIds) {
+    for (var k in map) {
+      if (!map.hasOwnProperty(k)) continue;
+      var id = parseInt(k, 10);
+      if (skipIds[id]) continue;
+      var now = isVisibleById(id);
+      if (now !== null && now !== map[k]) {
+        try { setVisibleById(id, map[k]); } catch (eR) {}
+      }
+    }
+  }
+
+  function duplicateHideAndRasterize(origId, nm) {
+    var layer = byId(origId);
+    if (!layer) throw new Error('layer not found by id');
+
+    var wasClipped = false;
+    var chainIds = [];
+    try { wasClipped = isClipped(layer); } catch (eC1) {}
+    try {
+      var chain = getClipChainAbove(layer);
+      for (var cc = 0; cc < chain.length; cc++) chainIds.push(idOf(chain[cc]));
+    } catch (eC2) {}
+
+    var visBefore = snapshotVisibility(app.activeDocument.layers, {});
+    BAKED_ORIGINAL_IDS.push(origId);
+
+    layer = byId(origId);
     var dup = layer.duplicate(layer, ElementPlacement.PLACEBEFORE);
+    var dupId = idOf(dup);
+    if (dupId === null) throw new Error('could not read duplicate id');
+    dup = byId(dupId);
     dup.name = nm;
 
     // Make sure the duplicate really sits directly above the original
     // (and so below the clipped layers), not somewhere else in the stack.
     try {
+      layer = byId(origId); dup = byId(dupId);
       var di = indexInParent(dup), oi = indexInParent(layer);
       if (di >= 0 && oi >= 0 && oi !== di + 1) {
         dup.move(layer, ElementPlacement.PLACEBEFORE);
       }
     } catch (eMv) {}
 
-    // Photoshop's duplicate() does not reliably mirror the source
-    // layer's visibility onto the new copy -- explicitly force it on so
-    // this never silently depends on that behavior.
-    dup.visible = true;
-    layer.visible = false;
-    try { layer.name = nm + ' (original, hidden)'; } catch (eRename) {}
-    // Re-assert after the rename -- belt and suspenders against the same
-    // kind of visibility drift this whole fix is guarding against.
-    layer.visible = false;
-    dup.rasterize(RasterizeType.ENTIRELAYER);
+    // Duplicate on, original off -- by id, explicitly.
+    setVisibleById(dupId, true);
+    setVisibleById(origId, false);
+    try { byId(origId).name = nm + ' (original, hidden)'; } catch (eRename) {}
+    setVisibleById(origId, false);
 
-    // Re-apply the clipping state recorded above.
-    try { setClipped(dup, wasClipped); } catch (eC3) {}
-    for (var ck = 0; ck < chain.length; ck++) {
-      try { setClipped(chain[ck], true); } catch (eC4) {}
+    byId(dupId).rasterize(RasterizeType.ENTIRELAYER);
+
+    // Re-apply the clipping state recorded above (fresh refs, by id).
+    try { var d2 = byId(dupId); if (d2) setClipped(d2, wasClipped); } catch (eC3) {}
+    for (var ck = 0; ck < chainIds.length; ck++) {
+      try { var cl = byId(chainIds[ck]); if (cl) setClipped(cl, true); } catch (eC4) {}
     }
-    return dup;
+
+    // Safety net: every other layer keeps the visibility it had before;
+    // the original ends hidden, the baked copy ends visible.
+    var skip = {}; skip[origId] = true; skip[dupId] = true;
+    restoreVisibility(visBefore, skip);
+    setVisibleById(origId, false);
+    setVisibleById(dupId, true);
+    return byId(dupId);
   }
 
   // Pass 1: just collect Smart Object layer references. Duplicating
@@ -1021,11 +1194,11 @@ function rasterizeScalableFilterLayers(doc, notes) {
       // top of the one baked in last time.
       var nmCheck = '';
       try { nmCheck = layer.name; } catch (enc) {}
-      if (!layer.visible && ALREADY_PROCESSED_RE.test(nmCheck)) continue;
+      if (ALREADY_PROCESSED_RE.test(nmCheck)) continue;
 
       var kind = null;
       try { kind = layer.kind; } catch (ek) {}
-      if (kind === LayerKind.SMARTOBJECT) out.push(layer);
+      if (kind === LayerKind.SMARTOBJECT) out.push(idOf(layer));
     }
   }
 
@@ -1033,7 +1206,9 @@ function rasterizeScalableFilterLayers(doc, notes) {
   collect(doc.layers, candidates);
 
   for (var ci = 0; ci < candidates.length; ci++) {
-    var layer = candidates[ci];
+    var candId = candidates[ci];
+    var layer = byId(candId);
+    if (!layer) continue;
     var nm = '(unnamed)';
     try { nm = layer.name; } catch (enm) {}
 
@@ -1059,7 +1234,7 @@ function rasterizeScalableFilterLayers(doc, notes) {
       // layer behind; skipping one that did have a blur would ship a
       // file where that blur silently doesn't scale.
       try {
-        duplicateHideAndRasterize(layer, nm);
+        duplicateHideAndRasterize(candId, nm);
         notes.push('NOTE: duplicated Smart Object layer "' + nm + '", rasterized the copy, and hid the original underneath, as a precaution before resizing -- Photoshop would not let this script check it for Motion Blur/blur Smart Filters directly, so it was baked in on a copy rather than risk shipping an unscaled blur. The original live Smart Object is preserved in the file, just hidden.');
       } catch (eForce) {
         notes.push('NOTE: could not check, or duplicate/rasterize, Smart Filter layer "' + nm + '" (' + eForce.message + '). If this layer has a Motion Blur/Gaussian Blur/etc Smart Filter, it will NOT scale with this resize.');
@@ -1069,7 +1244,7 @@ function rasterizeScalableFilterLayers(doc, notes) {
 
     if (scalable) {
       try {
-        duplicateHideAndRasterize(layer, nm);
+        duplicateHideAndRasterize(candId, nm);
         notes.push('NOTE: duplicated Smart Object layer "' + nm + '" and rasterized the copy to bake in its Motion Blur/blur filter before resizing, so the blur scales proportionally with the canvas. The original live Smart Object is preserved in the file, just hidden underneath.');
       } catch (eRas) {
         notes.push('NOTE: detected a scalable Smart Filter on layer "' + nm + '" but could not duplicate/rasterize it (' + eRas.message + '). Its blur will NOT scale with this resize.');
@@ -1195,6 +1370,9 @@ try {
   // happens, which preserves the original flat-40px stroke behavior.
   var STYLE_SCALE_RATIO = 1;
 
+  var VIS_SNAPSHOT = null;
+  try { VIS_SNAPSHOT = snapshotAllVisibility(doc.layers, {}); } catch (eSnap) {}
+
   if (DO_RESIZE) {
     // Bake any Motion Blur/blur Smart Filters into flat pixels BEFORE
     // resizing -- see rasterizeScalableFilterLayers() above for why this
@@ -1240,6 +1418,8 @@ try {
       }
     }
   }
+
+  try { enforceVisibility(doc, VIS_SNAPSHOT, result.errors); } catch (eEnf1) {}
 
   var group = null;
   try { group = doc.layerSets.add(); group.name = %(GROUP_NAME)s; applyStrokeStyle(group, STYLE_SCALE_RATIO); }
@@ -1334,6 +1514,10 @@ try {
       result.errors.push('NOTE: could not collapse the BG group (Photoshop kept it open).');
     }
   }
+
+  // Final visibility pass: runs last, right before saving, so nothing can
+  // flip a hidden original back on (or toggle another layer) after it.
+  try { enforceVisibility(doc, VIS_SNAPSHOT, result.errors); } catch (eEnf2) {}
 
   app.preferences.rulerUnits = prevRuler;
 
