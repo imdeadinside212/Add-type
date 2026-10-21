@@ -13,6 +13,8 @@ Two tools, one window, one .exe -- switch between them with tabs at the top:
     (leave unset to reuse an existing textboxes.json in the folder)
 
   [ ] Resize before placing text     Width (px): [____]   DPI: [____]
+  [x] Make folder BG   (checked by default; unchecked = no locked BG group,
+                        and every group in the file is collapsed instead)
 
   [ Run ]  [ Show details ]
 
@@ -1304,12 +1306,33 @@ function setGroupExpanded(layerId, expanded) {
   return false;
 }
 
+// Collapse EVERY group in the document (including nested ones). Used when
+// "Make folder BG" is unchecked. First tries Photoshop's own "Collapse All
+// Groups" command, then walks the groups and closes any that are still open.
+function collapseSetsRecursive(sets) {
+  for (var i = 0; i < sets.length; i++) {
+    var s = sets[i];
+    try { collapseSetsRecursive(s.layerSets); } catch (eN) {}
+    try {
+      if (getGroupExpanded(s.id) !== false) setGroupExpanded(s.id, false);
+    } catch (eS) {}
+  }
+}
+
+function collapseAllGroups(doc) {
+  try {
+    executeAction(stringIDToTypeID('collapseAllGroupsEvent'), new ActionDescriptor(), DialogModes.NO);
+  } catch (eAll) {}
+  try { collapseSetsRecursive(doc.layerSets); } catch (eWalk) {}
+}
+
 // ---- injected per-file parameters ----
 var FILE_PATH   = %(FILE_PATH)s;
 var DO_RESIZE   = %(DO_RESIZE)s;
 var RESIZE_W    = %(RESIZE_W)s;
 var RESIZE_DPI  = %(RESIZE_DPI)s;
 var BOX_LIST    = %(BOX_LIST)s;
+var MAKE_BG     = %(MAKE_BG)s;
 
 // ---- run: resize FIRST (if requested), THEN place text -- a single
 // open/close per file. This is safe because BOX_LIST's ratios were built
@@ -1474,7 +1497,7 @@ try {
   // is the Background layer, go directly above it; otherwise go to the
   // very end of the document.
   var bgGroup = null;
-  try {
+  if (MAKE_BG) try {
     bgGroup = doc.layerSets.add(); bgGroup.name = 'BG';
     var bottomLayer = doc.layers[doc.layers.length - 1];
     var bottomIsBackground = false;
@@ -1512,6 +1535,15 @@ try {
     var bgClosed = setGroupExpanded(bgGroup.id, false);
     if (!bgClosed) {
       result.errors.push('NOTE: could not collapse the BG group (Photoshop kept it open).');
+    }
+  }
+
+  // "Make folder BG" unchecked: no BG group was made; instead collapse every
+  // group in the file. Runs last among the layer-panel operations so nothing
+  // after it can re-open a group.
+  if (!MAKE_BG) {
+    try { collapseAllGroups(doc); } catch (eCol) {
+      result.errors.push('NOTE: could not collapse all groups (\"' + eCol.message + '\").');
     }
   }
 
@@ -1875,7 +1907,7 @@ def _run_with_dialog_watchdog(ps_app, fn):
             watcher.join(timeout=2)
 
 
-def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, group_name="TR"):
+def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, group_name="TR", make_bg=True):
     """Resize (if requested) and place text -- a single Photoshop open/close for this file.
 
     group_name names the layer group the text boxes are placed into
@@ -1888,6 +1920,7 @@ def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, g
         "RESIZE_DPI": resize_dpi if resize_dpi else 72,
         "BOX_LIST": json.dumps(box_list),
         "GROUP_NAME": js_string(group_name or "TR"),
+        "MAKE_BG": "true" if make_bg else "false",
     }
     raw = _run_with_dialog_watchdog(ps_app, lambda: ps_app.DoJavaScript(script))
     return parse_result(raw)
@@ -3387,6 +3420,7 @@ class PlacerTab(ttk.Frame):
 
         self.folder = tk.StringVar(value="No folder selected")
         self.do_resize = tk.BooleanVar(value=False)
+        self.make_bg = tk.BooleanVar(value=True)
         self.resize_width = tk.StringVar(value="")
         self.resize_dpi = tk.StringVar(value="")
         self.html_file_path = tk.StringVar(value="")
@@ -3434,6 +3468,11 @@ class PlacerTab(ttk.Frame):
         self.dpi_entry = ttk.Entry(opts2, textvariable=self.resize_dpi, width=8, state='disabled')
         self.dpi_entry.pack(side='left')
 
+        opts3 = ttk.Frame(self, style="Card.TFrame", padding=(14, 4, 14, 0))
+        opts3.pack(fill='x')
+        ttk.Checkbutton(opts3, text="Make folder BG", variable=self.make_bg,
+                         style="Card.TCheckbutton").pack(side='left')
+
         btns = ttk.Frame(self, style="Card.TFrame", padding=14)
         btns.pack(fill='x')
         self.run_btn = ttk.Button(btns, text="Run", style="Primary.TButton",
@@ -3471,7 +3510,7 @@ class PlacerTab(ttk.Frame):
             self.winfo_toplevel().geometry("780x600")
         else:
             self.log_frame.pack_forget()
-            self.winfo_toplevel().geometry("780x300")
+            self.winfo_toplevel().geometry("780x330")
 
     def _status(self, text):
         """One-line, always-visible status update (e.g. 'Processing 3/12...')."""
@@ -3618,7 +3657,7 @@ class PlacerTab(ttk.Frame):
         self.stop_btn.config(state='normal')
         threading.Thread(
             target=self._run_pipeline_thread,
-            args=(do_extract, source, is_url, resize_width, resize_dpi),
+            args=(do_extract, source, is_url, resize_width, resize_dpi, self.make_bg.get()),
             daemon=True
         ).start()
 
@@ -3628,7 +3667,7 @@ class PlacerTab(ttk.Frame):
         self._status("Stopping after the current file finishes...")
         self._log("\n>>> Stop requested -- finishing the file in progress, then stopping.")
 
-    def _run_pipeline_thread(self, do_extract, source, is_url, resize_width, resize_dpi):
+    def _run_pipeline_thread(self, do_extract, source, is_url, resize_width, resize_dpi, make_bg=True):
         if pythoncom is not None:
             pythoncom.CoInitialize()
         try:
@@ -3764,7 +3803,7 @@ class PlacerTab(ttk.Frame):
                     "Processing %d/%d: %s ..." % (i + 1, len(self._files_info), f["name"])
                 ))
                 try:
-                    result = run_one_file(ps_app, f["path"], box_list, do_resize, resize_width, resize_dpi, group_name)
+                    result = run_one_file(ps_app, f["path"], box_list, do_resize, resize_width, resize_dpi, group_name, make_bg)
                 except Exception as e:
                     result = {"ok": 0, "total": len(box_list), "errors": [str(e)]}
 
