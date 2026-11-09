@@ -179,7 +179,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -3411,72 +3411,263 @@ def scan_folder(folder):
 # ══════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════
-#  TAB 1 GUI: BATCH TEXT PLACER + RESIZER
+#  TAB 1 GUI: BATCH TEXT PLACER + RESIZER  (multi-chapter)
 # ══════════════════════════════════════════════════════════════════
 
+CHAPTER_ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth",
+                    "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
+
+
+def chapter_ordinal(index):
+    """0 -> 'First', 1 -> 'Second', ... 10 -> '11th' (fallback past tenth)."""
+    if index < len(CHAPTER_ORDINALS):
+        return CHAPTER_ORDINALS[index]
+    n = index + 1
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, suffix)
+
+
+def short_path(path, parts=2):
+    """Collapses a long folder path to its last 2 parts (3 if they are very
+    short), e.g. 'D:/Work/Series/282/외전 2화' -> '282/외전 2화'."""
+    p = os.path.normpath(path).replace("\\", "/").rstrip("/")
+    pieces = [x for x in p.split("/") if x]
+    if len(pieces) >= 3 and len("/".join(pieces[-2:])) <= 12:
+        parts = 3
+    return "/".join(pieces[-parts:]) if pieces else path
+
+
+class ChapterRow(ttk.Frame):
+    """One chapter's controls: folder, saved-HTML status, resize and BG options.
+    Also holds that chapter's own scan state (files, JSON, html), so several
+    chapters can be prepared and run in one go."""
+
+    TRASH_COLOR = "#8A94A3"
+    TRASH_HOVER = "#D64545"
+
+    def __init__(self, owner, parent, removable):
+        super().__init__(parent, style="Card.TFrame")
+        self.owner = owner
+        self.locked = False
+
+        self.folder = ""
+        self.files_info = None
+        self.json_path = None
+        self.data = None
+        self.html_path = ""
+        self.is_mhtml = False
+        self.multiple_html = False
+
+        self.do_resize = tk.BooleanVar(value=False)
+        self.resize_width = tk.StringVar(value="")
+        self.resize_dpi = tk.StringVar(value="")
+        self.make_bg = tk.BooleanVar(value=True)
+        self.path_text = tk.StringVar(value="")
+        self.html_text = tk.StringVar(value="")
+
+        head = ttk.Frame(self, style="Card.TFrame")
+        head.pack(fill='x')
+        self.choose_btn = ttk.Button(head, text="Choose Folder...", style="Primary.TButton",
+                                     command=self.choose_folder)
+        self.choose_btn.pack(side='left')
+        ttk.Label(head, textvariable=self.path_text, style="CardMuted.TLabel",
+                  width=20, anchor='w').pack(side='left', padx=(12, 0))
+        self.html_label = ttk.Label(head, textvariable=self.html_text, style="Card.TLabel")
+        self.html_label.pack(side='left', padx=(8, 0))
+        # Clicking the OK/MISSING text lets you point at a saved file by hand
+        # (replaces the old "Browse..." button without changing the layout).
+        self.html_label.bind("<Button-1>", lambda e: self.choose_html_file())
+
+        self.trash = None
+        if removable:
+            self.trash = tk.Canvas(head, width=20, height=22, bg=COLORS["surface"],
+                                   highlightthickness=0, cursor="hand2")
+            self._draw_trash(self.TRASH_COLOR)
+            self.trash.pack(side='right', padx=(0, 4))
+            self.trash.bind("<Enter>", lambda e: self._draw_trash(self.TRASH_HOVER))
+            self.trash.bind("<Leave>", lambda e: self._draw_trash(self.TRASH_COLOR))
+            self.trash.bind("<Button-1>", lambda e: self._remove())
+
+        opts = ttk.Frame(self, style="Card.TFrame")
+        opts.pack(fill='x', pady=(8, 0))
+        ttk.Checkbutton(opts, text="Resize (bilinear)", variable=self.do_resize,
+                        style="Card.TCheckbutton", command=self._toggle_resize_fields).pack(side='left')
+        ttk.Label(opts, text="Width (px):", style="Card.TLabel").pack(side='left', padx=(15, 3))
+        self.width_entry = ttk.Entry(opts, textvariable=self.resize_width, width=8, state='disabled')
+        self.width_entry.pack(side='left')
+        ttk.Label(opts, text="DPI:", style="Card.TLabel").pack(side='left', padx=(15, 3))
+        self.dpi_entry = ttk.Entry(opts, textvariable=self.resize_dpi, width=8, state='disabled')
+        self.dpi_entry.pack(side='left')
+        self.bg_check = ttk.Checkbutton(opts, text="Make folder BG", variable=self.make_bg,
+                                        style="Card.TCheckbutton")
+        self.bg_check.pack(side='left', padx=(40, 0))
+
+        # hairline separator under every chapter
+        tk.Frame(self, height=1, bg=COLORS["border"]).pack(fill='x', pady=(12, 0))
+
+        self._interactive = [self.choose_btn, self.bg_check]
+        for w in opts.winfo_children():
+            if isinstance(w, ttk.Checkbutton):
+                self._interactive.append(w)
+
+    # ── small helpers ────────────────────────────────────────────
+    def _draw_trash(self, color):
+        c = self.trash
+        c.delete("all")
+        c.create_rectangle(8, 2, 12, 4, outline=color, width=1)          # handle
+        c.create_line(3, 5, 17, 5, fill=color, width=2)                  # lid
+        c.create_polygon(5, 7, 15, 7, 14, 19, 6, 19, outline=color, fill="", width=1)  # body
+        for x in (8, 10, 12):
+            c.create_line(x, 9, x, 17, fill=color)
+
+    def _remove(self):
+        if not self.locked:
+            self.owner.remove_chapter(self)
+
+    def _toggle_resize_fields(self):
+        state = 'normal' if (self.do_resize.get() and not self.locked) else 'disabled'
+        self.width_entry.config(state=state)
+        self.dpi_entry.config(state=state)
+
+    def set_locked(self, locked):
+        self.locked = locked
+        st = ['disabled'] if locked else ['!disabled']
+        for w in self._interactive:
+            w.state(st)
+        self._toggle_resize_fields()
+        if self.trash is not None:
+            self.trash.config(cursor="arrow" if locked else "hand2")
+
+    def is_ready(self):
+        """Chapter has a folder with PSDs and some translation source."""
+        return bool(self.files_info) and (bool(self.html_path) or bool(self.data))
+
+    def _set_html_status(self):
+        if self.html_path and os.path.isfile(self.html_path):
+            self.html_text.set("File html: OK")
+            self.html_label.config(foreground=COLORS["text"])
+        else:
+            self.html_text.set("File html: MISSING")
+            self.html_label.config(foreground="#D64545")
+
+    # ── folder / file selection ──────────────────────────────────
+    def choose_html_file(self):
+        if self.locked or not self.folder:
+            return
+        path = filedialog.askopenfilename(
+            title="Select saved HTML or MHTML file",
+            initialdir=self.folder,
+            filetypes=[
+                ("HTML files", "*.html *.htm"),
+                ("MHTML files (auto-unpacked to HTML)", "*.mhtml *.mht"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not path:
+            return
+        self.html_path = path
+        self.is_mhtml = path.lower().endswith((".mhtml", ".mht"))
+        self._set_html_status()
+        self.owner.refresh_summary()
+
+    def choose_folder(self):
+        if self.locked:
+            return
+        folder = filedialog.askdirectory(title="Select folder with PSD files")
+        if not folder:
+            return
+        self.load_folder(folder)
+
+    def load_folder(self, folder):
+        try:
+            json_path, files_info, multiple_json, html_path, is_mhtml, multiple_html = scan_folder(folder)
+        except ValueError as e:
+            messagebox.showwarning("Nothing to process", str(e))
+            return
+
+        self.folder = folder
+        self.path_text.set(short_path(folder))
+        self.files_info = files_info
+        self.json_path = json_path
+        self.data = None
+        self.html_path = html_path or ""
+        self.is_mhtml = is_mhtml
+        self.multiple_html = multiple_html
+        self._set_html_status()
+
+        log_lines = ["[%s chapter] %s" % (chapter_ordinal(self.owner.index_of(self)), folder)]
+        for f in files_info:
+            log_lines.append("  %-40s %dx%d" % (f["name"], f["width"], f["height"]))
+        if html_path:
+            log_lines.append("Found saved web file: %s%s%s" % (
+                os.path.basename(html_path),
+                "  (multiple found, using this one -- .html preferred over .mhtml)" if multiple_html else "",
+                "  (.mhtml -- will be auto-unpacked to plain HTML before extraction)" if is_mhtml else ""
+            ))
+        if json_path:
+            try:
+                with open(json_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if data.get("pages"):
+                    self.data = data
+                    log_lines.append("Existing JSON found: %s (%d page(s))" % (
+                        os.path.basename(json_path), len(data["pages"])))
+                else:
+                    log_lines.append("Existing JSON found but has no pages: %s" % os.path.basename(json_path))
+            except (json.JSONDecodeError, OSError) as e:
+                log_lines.append("Existing JSON found but could not be read: %s" % e)
+        elif not html_path:
+            log_lines.append("No saved html/mhtml and no textboxes.json in this folder.")
+        self.owner.log_lines(log_lines)
+        self.owner.refresh_summary()
+
+
 class PlacerTab(ttk.Frame):
+    MAX_LIST_HEIGHT = 340   # chapter list scrolls beyond this
+
     def __init__(self, parent):
         super().__init__(parent, style="Card.TFrame")
 
-        self.folder = tk.StringVar(value="No folder selected")
-        self.do_resize = tk.BooleanVar(value=False)
-        self.make_bg = tk.BooleanVar(value=True)
-        self.resize_width = tk.StringVar(value="")
-        self.resize_dpi = tk.StringVar(value="")
-        self.html_file_path = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="")
         self.show_details = tk.BooleanVar(value=False)
-
-        self._json_path = None
-        self._files_info = None
-        self._data = None
+        self.rows = []
         self._stop_event = threading.Event()
+        self._running = False
 
         self._build_ui()
+        self.add_chapter()   # always start with one chapter
 
+    # ── UI ───────────────────────────────────────────────────────
     def _build_ui(self):
-        top = ttk.Frame(self, style="Card.TFrame", padding=(14, 14, 14, 6))
-        top.pack(fill='x')
-        ttk.Button(top, text="Choose Folder...", style="Primary.TButton",
-                   command=self.choose_folder).pack(side='left')
-        ttk.Label(top, textvariable=self.folder, style="CardMuted.TLabel").pack(side='left', padx=10)
+        # Scrollable area that holds the chapter rows
+        holder = ttk.Frame(self, style="Card.TFrame", padding=(14, 14, 14, 0))
+        holder.pack(fill='x')
+        self.canvas = tk.Canvas(holder, bg=COLORS["surface"], highlightthickness=0,
+                                height=10, borderwidth=0)
+        self.vbar = ttk.Scrollbar(holder, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.pack(side='left', fill='x', expand=True)
+        self.list_frame = ttk.Frame(self.canvas, style="Card.TFrame")
+        self._list_window = self.canvas.create_window((0, 0), window=self.list_frame, anchor='nw')
+        self.list_frame.bind("<Configure>", lambda e: self._sync_list_size())
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._list_window, width=e.width))
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
-        opts = ttk.LabelFrame(self, text="Extraction source", style="Card.TLabelframe", padding=12)
-        opts.pack(fill='x', padx=14, pady=(6, 6))
+        add_row = ttk.Frame(self, style="Card.TFrame", padding=(14, 8, 14, 0))
+        add_row.pack(fill='x')
+        self.add_label = ttk.Label(add_row, text="Add another chapter", style="CardMuted.TLabel",
+                                   cursor="hand2")
+        self.add_label.pack(side='left')
+        self.add_label.bind("<Button-1>", lambda e: self.add_chapter(user_action=True))
+        self.add_label.bind("<Enter>", lambda e: self.add_label.config(foreground=COLORS["primary"]))
+        self.add_label.bind("<Leave>", lambda e: self.add_label.config(foreground=COLORS["text_muted"]))
 
-        file_row = ttk.Frame(opts, style="Card.TFrame")
-        file_row.pack(fill='x')
-        ttk.Label(file_row, text="Saved HTML/MHTML file:", style="Card.TLabel").pack(side='left')
-        self.file_path_label = ttk.Label(file_row, textvariable=self.html_file_path, style="CardMuted.TLabel")
-        self.file_path_label.pack(side='left', padx=(6, 6))
-        self.browse_file_btn = ttk.Button(file_row, text="Browse...", command=self.choose_html_file)
-        self.browse_file_btn.pack(side='left')
-
-        ttk.Label(
-            opts, style="CardMuted.TLabel",
-            text="Leave unset to reuse an existing textboxes.json already in the chosen folder."
-        ).pack(fill='x', pady=(4, 0))
-
-        opts2 = ttk.Frame(self, style="Card.TFrame", padding=(14, 0))
-        opts2.pack(fill='x')
-        ttk.Checkbutton(opts2, text="Resize before placing text (bilinear resample)", variable=self.do_resize,
-                         style="Card.TCheckbutton", command=self._toggle_resize_fields).pack(side='left')
-        ttk.Label(opts2, text="Width (px):", style="Card.TLabel").pack(side='left', padx=(15, 3))
-        self.width_entry = ttk.Entry(opts2, textvariable=self.resize_width, width=8, state='disabled')
-        self.width_entry.pack(side='left')
-        ttk.Label(opts2, text="DPI:", style="Card.TLabel").pack(side='left', padx=(15, 3))
-        self.dpi_entry = ttk.Entry(opts2, textvariable=self.resize_dpi, width=8, state='disabled')
-        self.dpi_entry.pack(side='left')
-
-        opts3 = ttk.Frame(self, style="Card.TFrame", padding=(14, 4, 14, 0))
-        opts3.pack(fill='x')
-        ttk.Checkbutton(opts3, text="Make folder BG", variable=self.make_bg,
-                         style="Card.TCheckbutton").pack(side='left')
-
-        btns = ttk.Frame(self, style="Card.TFrame", padding=14)
+        btns = ttk.Frame(self, style="Card.TFrame", padding=(14, 22, 14, 14))
         btns.pack(fill='x')
         self.run_btn = ttk.Button(btns, text="Run", style="Primary.TButton",
-                                   command=self.run_batch, state='disabled')
+                                  command=self.run_batch, state='disabled')
         self.run_btn.pack(side='left')
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop_batch, state='disabled')
         self.stop_btn.pack(side='left', padx=(8, 0))
@@ -3486,12 +3677,10 @@ class PlacerTab(ttk.Frame):
         )
         self.details_btn.pack(side='left', padx=(15, 0))
 
-        self.summary = ttk.Label(self, text="", style="CardMuted.TLabel", padding=(14, 0))
+        # One single line of state text under the buttons (idle info / progress / result)
+        self.summary = ttk.Label(self, textvariable=self.status_text, style="CardMuted.TLabel",
+                                 padding=(14, 0, 14, 8))
         self.summary.pack(fill='x')
-
-        self.status_label = ttk.Label(self, textvariable=self.status_text, style="Status.TLabel",
-                                       background=COLORS["surface"], padding=(14, 4))
-        self.status_label.pack(fill='x')
 
         self.log_frame = ttk.Frame(self, style="Card.TFrame", padding=14)
         self.log = scrolledtext.ScrolledText(
@@ -3500,39 +3689,41 @@ class PlacerTab(ttk.Frame):
             insertbackground=COLORS["text"],
         )
         self.log.pack(fill='both', expand=True)
-        # log_frame is intentionally NOT packed here -- it stays hidden until
-        # "Show details" is checked, so day-to-day use just shows the one-line
-        # status above instead of a big scroll of progress text.
+        # log_frame stays hidden until "Show details" is checked.
+
+    def _on_wheel(self, event):
+        if self.vbar.winfo_ismapped():
+            step = -1 * (event.delta // 120) if abs(event.delta) >= 120 else -1 * event.delta
+            self.canvas.yview_scroll(int(step), "units")
+
+    def _sync_list_size(self):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        need = self.list_frame.winfo_reqheight()
+        self.canvas.configure(height=min(need, self.MAX_LIST_HEIGHT))
+        if need > self.MAX_LIST_HEIGHT:
+            if not self.vbar.winfo_ismapped():
+                self.vbar.pack(side='right', fill='y')
+        elif self.vbar.winfo_ismapped():
+            self.vbar.pack_forget()
+
+    def _fit_window(self):
+        """Resize the window to fit the current content (chapters / details)."""
+        self.update_idletasks()
+        top = self.winfo_toplevel()
+        h = self.winfo_reqheight() + 120   # tab strip + outer padding + version bar
+        h = min(h, top.winfo_screenheight() - 80)
+        top.geometry("%dx%d" % (780, max(h, 330)))
 
     def _toggle_details(self):
         if self.show_details.get():
             self.log_frame.pack(fill='both', expand=True)
-            self.winfo_toplevel().geometry("780x600")
         else:
             self.log_frame.pack_forget()
-            self.winfo_toplevel().geometry("780x330")
+        self._fit_window()
 
+    # ── log / status ─────────────────────────────────────────────
     def _status(self, text):
-        """One-line, always-visible status update (e.g. 'Processing 3/12...')."""
         self.status_text.set(text)
-
-    def _toggle_resize_fields(self):
-        state = 'normal' if self.do_resize.get() else 'disabled'
-        self.width_entry.config(state=state)
-        self.dpi_entry.config(state=state)
-
-    def choose_html_file(self):
-        path = filedialog.askopenfilename(
-            title="Select saved HTML or MHTML file",
-            filetypes=[
-                ("HTML files", "*.html *.htm"),
-                ("MHTML files (auto-unpacked to HTML)", "*.mhtml *.mht"),
-                ("All files", "*.*"),
-            ]
-        )
-        if not path:
-            return
-        self.html_file_path.set(path)
 
     def _log(self, text):
         self.log.config(state='normal')
@@ -3540,95 +3731,102 @@ class PlacerTab(ttk.Frame):
         self.log.see('end')
         self.log.config(state='disabled')
 
-    def choose_folder(self):
-        folder = filedialog.askdirectory(title="Select folder with PSD files")
-        if not folder:
+    def log_lines(self, lines):
+        for ln in lines:
+            self._log(ln)
+
+    # ── chapter management ───────────────────────────────────────
+    def index_of(self, row):
+        return self.rows.index(row)
+
+    def add_chapter(self, user_action=False):
+        if self._running:
             return
-        self.folder.set(folder)
+        row = ChapterRow(self, self.list_frame, removable=bool(self.rows))
+        row.pack(fill='x', pady=(0, 10))
+        self.rows.append(row)
+        self.refresh_summary()
+        if user_action:
+            self._fit_window()
+            self.after(50, lambda: self.canvas.yview_moveto(1.0))
 
-        try:
-            json_path, files_info, multiple_json, html_path, is_mhtml, multiple_html = scan_folder(folder)
-        except ValueError as e:
-            messagebox.showwarning("Nothing to process", str(e))
-            self.run_btn.config(state='disabled')
+    def remove_chapter(self, row):
+        if self._running or len(self.rows) <= 1 or row not in self.rows:
             return
+        self.rows.remove(row)
+        row.destroy()
+        self.refresh_summary()
+        self.after(10, self._fit_window)
 
-        self._json_path = json_path
-        self._files_info = files_info
-        self._data = None
+    def refresh_summary(self):
+        """Idle state text: single chapter -> file count + JSON; multi -> 'X chapter with trans OK'."""
+        if self._running:
+            return
+        ready = [r for r in self.rows if r.is_ready()]
+        self.run_btn.config(state='normal' if ready else 'disabled')
 
-        self.log.config(state='normal')
-        self.log.delete('1.0', 'end')
-        self.log.config(state='disabled')
-        for f in files_info:
-            self._log("  %-40s %dx%d" % (f["name"], f["width"], f["height"]))
+        if len(self.rows) == 1:
+            r = self.rows[0]
+            if r.files_info:
+                self._status("%d file(s) found.%s" % (
+                    len(r.files_info),
+                    "  JSON: %s" % os.path.basename(r.json_path) if r.json_path else "  No JSON yet"
+                ))
+            else:
+                self._status("")
+        else:
+            self._status("%d chapter with trans OK" % len(ready))
 
-        if html_path:
-            self.html_file_path.set(html_path)
-            self._log("Found saved web file: %s%s%s" % (
-                os.path.basename(html_path),
-                "  (multiple found, using this one -- .html preferred over .mhtml)" if multiple_html else "",
-                "  (.mhtml -- will be auto-unpacked to plain HTML before extraction)" if is_mhtml else ""
-            ))
-
-        if json_path:
-            # A JSON already sits in the folder. If a saved file/URL is set,
-            # it gets overwritten by a fresh extraction when Run is clicked.
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if data.get("pages"):
-                    self._data = data
-                    self._log("Existing JSON found: %s (%d page(s))" % (
-                        os.path.basename(json_path), len(data["pages"])
-                    ))
-                else:
-                    self._log("Existing JSON found but has no pages: %s" % os.path.basename(json_path))
-            except (json.JSONDecodeError, OSError) as e:
-                self._log("Existing JSON found but could not be read: %s" % e)
-        elif not html_path:
-            self._log("No existing textboxes.json -- pick a saved HTML/MHTML file above before running.")
-
-        self.summary.config(
-            text="%d file(s) found.%s" % (
-                len(files_info),
-                "  JSON: %s" % os.path.basename(json_path) if json_path else "  No JSON yet"
-            )
-        )
-
-        self.run_btn.config(state='normal')
-
+    # ── run ──────────────────────────────────────────────────────
     def run_batch(self):
         if sys.platform != "darwin" and win32com is None:
             messagebox.showerror("Missing dependency", "This needs pywin32. Install with:\n    pip install pywin32")
             return
 
-        resize_width = None
-        resize_dpi = None
-        if self.do_resize.get():
-            try:
-                resize_width = int(self.resize_width.get())
-                resize_dpi = int(self.resize_dpi.get())
-                if resize_width <= 0 or resize_dpi <= 0:
-                    raise ValueError()
-            except ValueError:
-                messagebox.showerror("Invalid input", "Width and DPI must be positive whole numbers.")
+        multi = len(self.rows) > 1
+        jobs = []
+        for i, row in enumerate(self.rows):
+            name = "%s chapter" % chapter_ordinal(i)
+            if not row.files_info:
+                messagebox.showerror("Nothing to run", "%s: no folder chosen yet." % name)
                 return
 
-        source = self.html_file_path.get().strip()
-        is_url = False
-        do_extract = bool(source)
+            resize_width = resize_dpi = None
+            if row.do_resize.get():
+                try:
+                    resize_width = int(row.resize_width.get())
+                    resize_dpi = int(row.resize_dpi.get())
+                    if resize_width <= 0 or resize_dpi <= 0:
+                        raise ValueError()
+                except ValueError:
+                    messagebox.showerror("Invalid input",
+                                         "%s: Width and DPI must be positive whole numbers." % name)
+                    return
 
-        if not do_extract and not self._data:
-            messagebox.showerror(
-                "Nothing to run",
-                "No JSON is loaded and no extraction source was given. Either "
-                "browse to a saved HTML/MHTML file, or make sure a valid "
-                "textboxes.json is already in the folder."
-            )
-            return
+            source = row.html_path.strip()
+            do_extract = bool(source)
+            if do_extract and not os.path.isfile(source):
+                messagebox.showerror("File not found",
+                                     "%s: the saved HTML/MHTML file no longer exists:\n%s" % (name, source))
+                return
+            if not do_extract and not row.data:
+                messagebox.showerror(
+                    "Nothing to run",
+                    "%s: no saved HTML/MHTML file (File html: MISSING) and no valid "
+                    "textboxes.json in the folder.\n\nClick the MISSING text to pick a file by hand."
+                    % name
+                )
+                return
 
-        if sync_playwright is None and do_extract:
+            jobs.append({
+                "index": i, "name": name, "folder": row.folder,
+                "files_info": row.files_info, "data": row.data, "json_path": row.json_path,
+                "source": source, "do_extract": do_extract,
+                "resize_width": resize_width, "resize_dpi": resize_dpi,
+                "make_bg": row.make_bg.get(),
+            })
+
+        if sync_playwright is None and any(j["do_extract"] for j in jobs):
             messagebox.showerror(
                 "Missing dependency",
                 "Extraction needs the 'playwright' package. Install with:\n"
@@ -3637,29 +3835,27 @@ class PlacerTab(ttk.Frame):
             )
             return
 
-        if do_extract and not os.path.isfile(source):
-            messagebox.showerror("File not found", "The selected HTML/MHTML file no longer exists:\n" + source)
-            return
-
         confirm_lines = []
-        if do_extract:
-            confirm_lines.append("1) Open %s and extract textboxes.json (opens a Chrome/Edge window)." % (
-                os.path.basename(source)
-            ))
-        confirm_lines.append("%d) Make sure Photoshop is already OPEN, then process %d file(s)." % (
-            2 if do_extract else 1, len(self._files_info)
-        ))
+        for j in jobs:
+            what = "extract %s, " % os.path.basename(j["source"]) if j["do_extract"] else "use existing textboxes.json, "
+            what += "%d file(s)" % len(j["files_info"])
+            if j["resize_width"]:
+                what += ", resize to %dpx @ %d DPI" % (j["resize_width"], j["resize_dpi"])
+            confirm_lines.append(("%s: " % j["name"] if multi else "") + what)
+        confirm_lines.append("")
+        confirm_lines.append("Make sure Photoshop is already OPEN. A Chrome/Edge window will open "
+                             "for each extraction.")
         if not messagebox.askyesno("Confirm", "\n".join(confirm_lines)):
             return
 
         self._stop_event.clear()
+        self._running = True
         self.run_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
-        threading.Thread(
-            target=self._run_pipeline_thread,
-            args=(do_extract, source, is_url, resize_width, resize_dpi, self.make_bg.get()),
-            daemon=True
-        ).start()
+        for r in self.rows:
+            r.set_locked(True)
+        self.add_label.config(cursor="arrow")
+        threading.Thread(target=self._run_pipeline_thread, args=(jobs,), daemon=True).start()
 
     def stop_batch(self):
         self._stop_event.set()
@@ -3667,164 +3863,182 @@ class PlacerTab(ttk.Frame):
         self._status("Stopping after the current file finishes...")
         self._log("\n>>> Stop requested -- finishing the file in progress, then stopping.")
 
-    def _run_pipeline_thread(self, do_extract, source, is_url, resize_width, resize_dpi, make_bg=True):
+    def _connect_photoshop(self):
+        ps_app = None
+        connect_errors = []
+        if sys.platform == "darwin":
+            try:
+                ps_app = connect_mac_photoshop()
+            except Exception as e:
+                connect_errors.append(str(e))
+        else:
+            try:
+                ps_app = win32com.client.GetActiveObject("Photoshop.Application")
+            except Exception as e:
+                connect_errors.append("GetActiveObject: %s" % e)
+            if ps_app is None:
+                try:
+                    ps_app = win32com.client.Dispatch("Photoshop.Application")
+                except Exception as e:
+                    connect_errors.append("Dispatch: %s" % e)
+        return ps_app, connect_errors
+
+    def _run_pipeline_thread(self, jobs):
         if pythoncom is not None:
             pythoncom.CoInitialize()
+        multi = len(jobs) > 1
+        ps_app = None
+        grand_ok = grand_total = grand_files = 0
+        failed = []          # (chapter name, reason)
+        stopped_early = False
         try:
-            self.after(0, lambda: self._log("Pipeline build: %s" % PIPELINE_BUILD))
-            # ── Step 1: extract textboxes.json from the chosen source, if requested ──
-            if do_extract:
-                output_json_path = os.path.join(self.folder.get(), "textboxes.json")
-                label = source if is_url else os.path.basename(source)
-                self.after(0, lambda: self._status("Extracting text data from %s ..." % label))
-                self.after(0, lambda: self._log("\n=== Extracting textboxes.json from %s ===" % label))
-                try:
-                    extract_textboxes(
-                        source, is_url, output_json_path,
-                        log_cb=lambda m: self.after(0, lambda m=m: self._log(m))
-                    )
-                except Exception as e:
-                    self.after(0, lambda e=e: messagebox.showerror("Extraction failed", str(e)))
-                    return
+            self.after(0, lambda: self._log("\nPipeline build: %s" % PIPELINE_BUILD))
 
-                with open(output_json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if not data.get("pages"):
-                    self.after(0, lambda: messagebox.showerror("Extraction failed", "Downloaded JSON has no pages."))
-                    return
-                self._json_path = output_json_path
-                self._data = data
-                self.after(0, lambda: self._log(
-                    "Extraction done: %d page(s).\n" % len(data["pages"])
-                ))
-
-            if self._stop_event.is_set():
-                self.after(0, lambda: self._log("\nStopped before processing started."))
-                return
-
-            # ── Step 1b: detect the translation's language from the site's
-            #     own breadcrumb chip (e.g. "DE"), so the Photoshop group can
-            #     be named after it instead of the fixed "TR". Only possible
-            #     when a saved HTML/MHTML file was actually given this run --
-            #     falls back to "TR" (old behavior) otherwise or if the chip
-            #     isn't found. ─────────────────────────────────────────────
-            group_name = "TR"
-            if do_extract:
-                detected = detect_language_code(source)
-                if detected:
-                    group_name = detected
-                    self.after(0, lambda c=detected: self._log(
-                        "Detected language chip on the page: %s -- Photoshop group will be named \"%s\" instead of \"TR\"." % (c, c)
-                    ))
-                else:
-                    self.after(0, lambda: self._log(
-                        "Could not find a recognizable language chip on the page -- group will be named \"TR\" as before."
-                    ))
-
-            # ── Step 2: build the placement plan. This needs no resize size
-            #     at all (predicted or real) -- it works entirely in each
-            #     file's original dimensions, which are scale-invariant, so
-            #     it's exactly as correct whether or not resizing happens
-            #     later. ─────────────────────────────────────────────────────
-            self.after(0, lambda: self._status("Building placement plan..."))
-            dbg = debug_scale_info(self._files_info, self._data)
-            if dbg is not None:
-                self.after(0, lambda dbg=dbg: self._log(
-                    "Scale check: web_total_h=%.2f  orig_total_h(sum of PSD headers)=%.2f  design_scale=%.6f" %
-                    (dbg["web_total_h"], dbg["orig_total_h"], dbg["design_scale"])
-                ))
-            try:
-                per_file_boxes = build_plan(self._files_info, self._data)
-            except ValueError as e:
-                self.after(0, lambda e=e: messagebox.showerror("Cannot build plan", str(e)))
-                return
-
-            do_resize = resize_width is not None
-            resolved_dims = compute_resolved_dims(self._files_info, resize_width)  # for the log line only
-            total_boxes = sum(len(b) for b in per_file_boxes)
-            self.after(0, lambda: self._log("=== Plan ==="))
-            for i, f in enumerate(self._files_info):
-                dim = resolved_dims[i]
-                note = " (resized to %dx%d)" % (dim["w"], dim["h"]) if do_resize else ""
-                n = len(per_file_boxes[i])
-                self.after(0, lambda f=f, n=n, note=note: self._log("  %-40s -> %d text box(es)%s" % (f["name"], n, note)))
-            self.after(0, lambda: self._log("Total: %d text box(es) across %d file(s).\n" % (total_boxes, len(self._files_info))))
-
-            # ── Step 3: connect to Photoshop ──────────────────────────────────
-            self.after(0, lambda: self._status("Connecting to Photoshop..."))
-            self.after(0, lambda: self._log("Connecting to Photoshop..."))
-            ps_app = None
-            connect_errors = []
-
-            if sys.platform == "darwin":
-                try:
-                    ps_app = connect_mac_photoshop()
-                except Exception as e:
-                    connect_errors.append(str(e))
-            else:
-                try:
-                    ps_app = win32com.client.GetActiveObject("Photoshop.Application")
-                except Exception as e:
-                    connect_errors.append("GetActiveObject: %s" % e)
-
-                if ps_app is None:
-                    try:
-                        ps_app = win32com.client.Dispatch("Photoshop.Application")
-                    except Exception as e:
-                        connect_errors.append("Dispatch: %s" % e)
-
-            if ps_app is None:
-                msg = (
-                    "Could not connect to Photoshop.\n\n"
-                    "Make sure Photoshop is already open (not just installed), "
-                    "and that it is NOT set to \"Run as administrator\" "
-                    "(that must match how this script is run).\n\nDetails:\n" +
-                    "\n".join(connect_errors)
-                )
-                self.after(0, lambda m=msg: messagebox.showerror("Connection failed", m))
-                return
-
-            ps_app.DoJavaScript("app.displayDialogs = DialogModes.NO;")
-            self.after(0, lambda: self._log("Connected."))
-
-            # ── Step 4: resize + place text for each file, one open/close ────
-            total_ok = 0
-            stopped_early = False
-            for i, f in enumerate(self._files_info):
+            for job in jobs:
                 if self._stop_event.is_set():
                     stopped_early = True
-                    self.after(0, lambda: self._log(
-                        "\nStopped: %d/%d file(s) were not processed." % (len(self._files_info) - i, len(self._files_info))
-                    ))
                     break
 
-                box_list = per_file_boxes[i]
-                self.after(0, lambda i=i, f=f: self._status(
-                    "Processing %d/%d: %s ..." % (i + 1, len(self._files_info), f["name"])
-                ))
-                try:
-                    result = run_one_file(ps_app, f["path"], box_list, do_resize, resize_width, resize_dpi, group_name, make_bg)
-                except Exception as e:
-                    result = {"ok": 0, "total": len(box_list), "errors": [str(e)]}
+                name = job["name"]
+                files_info = job["files_info"]
+                data = job["data"]
+                json_path = job["json_path"]
+                source = job["source"]
+                resize_width = job["resize_width"]
+                resize_dpi = job["resize_dpi"]
+                n_files = len(files_info)
+                prefix = (name + ". ") if multi else ""
 
-                total_ok += result["ok"]
-                msg = "[%d/%d] %s: %d/%d placed" % (
-                    i + 1, len(self._files_info), f["name"], result["ok"], result["total"]
-                )
-                self.after(0, lambda m=msg: self._log(m))
-                for err in result.get("errors", []):
-                    prefix = "    - " if err.startswith("NOTE:") else "    ! "
-                    self.after(0, lambda e=err, p=prefix: self._log(p + e))
+                self.after(0, lambda n=name, f=job["folder"]: self._log("\n=== %s: %s ===" % (n, f)))
+
+                # ── Step 1: extract textboxes.json from THIS chapter's saved file ──
+                if job["do_extract"]:
+                    out_json = os.path.join(job["folder"], "textboxes.json")
+                    label = os.path.basename(source)
+                    self.after(0, lambda p=prefix, l=label: self._status("%sExtracting text data from %s ..." % (p, l)))
+                    self.after(0, lambda l=label: self._log("Extracting textboxes.json from %s ..." % l))
+                    try:
+                        extract_textboxes(
+                            source, False, out_json,
+                            log_cb=lambda m: self.after(0, lambda m=m: self._log(m))
+                        )
+                        with open(out_json, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if not data.get("pages"):
+                            raise RuntimeError("Extracted JSON has no pages.")
+                    except Exception as e:
+                        failed.append((name, "Extraction failed: %s" % e))
+                        self.after(0, lambda e=e: self._log("! Extraction failed: %s -- skipping this chapter." % e))
+                        continue
+                    json_path = out_json
+                    self.after(0, lambda d=data: self._log("Extraction done: %d page(s)." % len(d["pages"])))
+
+                if self._stop_event.is_set():
+                    stopped_early = True
+                    self.after(0, lambda: self._log("\nStopped before processing started."))
+                    break
+
+                # ── Step 1b: language chip -> Photoshop group name (per chapter) ──
+                group_name = "TR"
+                if job["do_extract"]:
+                    detected = detect_language_code(source)
+                    if detected:
+                        group_name = detected
+                        self.after(0, lambda c=detected: self._log(
+                            "Detected language chip on the page: %s -- Photoshop group will be named \"%s\" instead of \"TR\"." % (c, c)))
+                    else:
+                        self.after(0, lambda: self._log(
+                            "Could not find a recognizable language chip on the page -- group will be named \"TR\" as before."))
+
+                # ── Step 2: placement plan (scale-invariant, independent of resize) ──
+                self.after(0, lambda p=prefix: self._status("%sBuilding placement plan..." % p))
+                dbg = debug_scale_info(files_info, data)
+                if dbg is not None:
+                    self.after(0, lambda dbg=dbg: self._log(
+                        "Scale check: web_total_h=%.2f  orig_total_h(sum of PSD headers)=%.2f  design_scale=%.6f" %
+                        (dbg["web_total_h"], dbg["orig_total_h"], dbg["design_scale"])))
+                try:
+                    per_file_boxes = build_plan(files_info, data)
+                except ValueError as e:
+                    failed.append((name, "Cannot build plan: %s" % e))
+                    self.after(0, lambda e=e: self._log("! Cannot build plan: %s -- skipping this chapter." % e))
+                    continue
+
+                do_resize = resize_width is not None
+                resolved_dims = compute_resolved_dims(files_info, resize_width)
+                total_boxes = sum(len(b) for b in per_file_boxes)
+                self.after(0, lambda: self._log("=== Plan ==="))
+                for i, f in enumerate(files_info):
+                    dim = resolved_dims[i]
+                    note = " (resized to %dx%d)" % (dim["w"], dim["h"]) if do_resize else ""
+                    n = len(per_file_boxes[i])
+                    self.after(0, lambda f=f, n=n, note=note: self._log("  %-40s -> %d text box(es)%s" % (f["name"], n, note)))
+                self.after(0, lambda t=total_boxes, c=n_files: self._log("Total: %d text box(es) across %d file(s).\n" % (t, c)))
+
+                # ── Step 3: connect to Photoshop (once, reused for all chapters) ──
+                if ps_app is None:
+                    self.after(0, lambda p=prefix: self._status("%sConnecting to Photoshop..." % p))
+                    self.after(0, lambda: self._log("Connecting to Photoshop..."))
+                    ps_app, connect_errors = self._connect_photoshop()
+                    if ps_app is None:
+                        msg = (
+                            "Could not connect to Photoshop.\n\n"
+                            "Make sure Photoshop is already open (not just installed), "
+                            "and that it is NOT set to \"Run as administrator\" "
+                            "(that must match how this script is run).\n\nDetails:\n" +
+                            "\n".join(connect_errors)
+                        )
+                        self.after(0, lambda m=msg: messagebox.showerror("Connection failed", m))
+                        return
+                    ps_app.DoJavaScript("app.displayDialogs = DialogModes.NO;")
+                    self.after(0, lambda: self._log("Connected."))
+
+                # ── Step 4: resize + place text for each file of this chapter ──
+                self.after(0, lambda p=prefix, c=n_files: self._status("%sWorked %02d/%02d files" % (p, 0, c)))
+                chapter_ok = 0
+                for i, f in enumerate(files_info):
+                    if self._stop_event.is_set():
+                        stopped_early = True
+                        self.after(0, lambda i=i, c=n_files: self._log(
+                            "\nStopped: %d/%d file(s) of this chapter were not processed." % (c - i, c)))
+                        break
+
+                    box_list = per_file_boxes[i]
+                    try:
+                        result = run_one_file(ps_app, f["path"], box_list, do_resize,
+                                              resize_width, resize_dpi, group_name, job["make_bg"])
+                    except Exception as e:
+                        result = {"ok": 0, "total": len(box_list), "errors": [str(e)]}
+
+                    chapter_ok += result["ok"]
+                    msg = "[%d/%d] %s: %d/%d placed" % (i + 1, n_files, f["name"], result["ok"], result["total"])
+                    self.after(0, lambda m=msg: self._log(m))
+                    for err in result.get("errors", []):
+                        pfx = "    - " if err.startswith("NOTE:") else "    ! "
+                        self.after(0, lambda e=err, p=pfx: self._log(p + e))
+                    self.after(0, lambda p=prefix, d=i + 1, c=n_files: self._status("%sWorked %02d/%02d files" % (p, d, c)))
+
+                grand_ok += chapter_ok
+                grand_total += total_boxes
+                grand_files += n_files
+                self.after(0, lambda n=name, ok=chapter_ok, t=total_boxes: self._log(
+                    "%s done: %d/%d text boxes placed." % (n, ok, t)))
+                if stopped_early:
+                    break
 
             if stopped_early:
-                final_msg = "\nStopped by user. %d/%d text boxes placed before stopping." % (total_ok, total_boxes)
+                final_msg = "Stopped by user. %d/%d text boxes placed before stopping." % (grand_ok, grand_total)
             else:
-                final_msg = "\nDone. %d/%d text boxes placed across %d file(s)." % (
-                    total_ok, total_boxes, len(self._files_info)
-                )
-            self.after(0, lambda: self._log(final_msg))
-            self.after(0, lambda: self.summary.config(text=final_msg.strip()))
-            self.after(0, lambda: self._status(""))
+                final_msg = "Done. %d/%d text boxes placed across %d file(s)%s." % (
+                    grand_ok, grand_total, grand_files,
+                    " in %d chapter(s)" % (len(jobs) - len(failed)) if multi else "")
+            if failed:
+                final_msg += "  %d chapter(s) failed." % len(failed)
+            self.after(0, lambda: self._log("\n" + final_msg))
+            self.after(0, lambda m=final_msg: self._status(m))
+            if failed:
+                detail = "\n\n".join("%s: %s" % (n, r) for n, r in failed)
+                self.after(0, lambda d=detail: messagebox.showerror("Some chapters failed", d))
 
         except Exception as e:
             traceback.print_exc()
@@ -3832,8 +4046,15 @@ class PlacerTab(ttk.Frame):
         finally:
             if pythoncom is not None:
                 pythoncom.CoUninitialize()
-            self.after(0, lambda: self.run_btn.config(state='normal'))
-            self.after(0, lambda: self.stop_btn.config(state='disabled'))
+            self.after(0, self._finish_run)
+
+    def _finish_run(self):
+        self._running = False
+        for r in self.rows:
+            r.set_locked(False)
+        self.add_label.config(cursor="hand2")
+        self.stop_btn.config(state='disabled')
+        self.run_btn.config(state='normal')
 
 
 
