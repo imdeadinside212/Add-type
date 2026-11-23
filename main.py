@@ -13,6 +13,9 @@ Two tools, one window, one .exe -- switch between them with tabs at the top:
     (leave unset to reuse an existing textboxes.json in the folder)
 
   [ ] Resize before placing text     Width (px): [____]   DPI: [____]
+      (hidden when the series title is found in the Settings resize list --
+       the list's width/DPI/method are shown instead and applied automatically;
+       files that already match are not resized)
   [x] Make folder BG   (checked by default; unchecked = no locked BG group,
                         and every group in the file is collapsed instead)
 
@@ -123,7 +126,11 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
+import html as html_lib
+import quopri
 from email import policy as email_policy
+from email.parser import BytesHeaderParser
 from pathlib import Path
 
 import tkinter as tk
@@ -179,7 +186,7 @@ except ImportError:
     apply_update = None
 
 # Nho tang so nay moi lan ban tag + push ban moi (vd tag v1.0.1 -> "1.0.1")
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 
 
 IMAGE_EXTENSIONS = (".psd", ".psb", ".tif", ".tiff")
@@ -263,6 +270,17 @@ def setup_style(root):
         foreground=[("disabled", "#F0F3FC")],
     )
 
+    style.configure(
+        "Toolbar.TButton", background=COLORS["bg"], foreground=COLORS["text"],
+        bordercolor=COLORS["border"], borderwidth=1, focusthickness=0,
+        padding=(12, 4), font=base_font, relief="flat",
+    )
+    style.map(
+        "Toolbar.TButton",
+        background=[("active", COLORS["primary_lt"])],
+        foreground=[("active", COLORS["primary_dk"])],
+    )
+
     # ---- inputs -----------------------------------------------------------
     style.configure(
         "TEntry", fieldbackground=COLORS["surface"], background=COLORS["surface"],
@@ -334,6 +352,187 @@ def read_psd_dimensions(path):
     (signature, version, reserved, channels, height, width,
      depth, mode) = struct.unpack(">4sH6sHIIHH", header)
     return {"width": width, "height": height}
+
+
+def read_psd_resolution(path):
+    """Horizontal resolution (DPI) stored in a PSD/PSB's image-resources
+    section (resource 1005), or None if it can't be read. Read straight from
+    the file, so Photoshop is not needed."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"8BPS":
+                return None
+            f.seek(26)
+            (cm_len,) = struct.unpack(">I", f.read(4))
+            f.seek(cm_len, 1)
+            (res_len,) = struct.unpack(">I", f.read(4))
+            end = f.tell() + res_len
+            while f.tell() + 12 <= end:
+                sig = f.read(4)
+                if sig not in (b"8BIM", b"8B64"):
+                    return None
+                (rid,) = struct.unpack(">H", f.read(2))
+                (name_len,) = struct.unpack(">B", f.read(1))
+                skip = name_len + (1 if (1 + name_len) % 2 else 0)
+                f.seek(skip, 1)
+                (size,) = struct.unpack(">I", f.read(4))
+                if rid == 1005:
+                    data = f.read(size)
+                    if len(data) < 6:
+                        return None
+                    hres = struct.unpack(">I", data[0:4])[0] / 65536.0
+                    hunit = struct.unpack(">H", data[4:6])[0]
+                    return hres * 2.54 if hunit == 2 else hres   # 2 = pixels/cm
+                f.seek(size + (size % 2), 1)
+    except Exception:
+        return None
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SETTINGS (saved to a small JSON file in the user's config folder)
+# ══════════════════════════════════════════════════════════════════
+
+# key -> (label shown in the UI, Photoshop string ID, ExtendScript enum name)
+RESAMPLE_METHODS = {
+    "bilinear":        ("Bilinear",         "bilinear",        "BILINEAR"),
+    "bicubic":         ("Bicubic",          "bicubic",         "BICUBIC"),
+    "bicubicSharper":  ("Bicubic Sharper",  "bicubicSharper",  "BICUBICSHARPER"),
+    "bicubicSmoother": ("Bicubic Smoother", "bicubicSmoother", "BICUBICSMOOTHER"),
+    "nearestNeighbor": ("Nearest Neighbor", "nearestNeighbor", "NEARESTNEIGHBOR"),
+}
+DEFAULT_RESAMPLE = "bilinear"
+
+DEFAULT_SETTINGS = {
+    "stroke_enabled": True,       # stroke effect on the text group
+    "keep_json": True,            # keep textboxes.json after the run
+    "resize_rules": [],           # [{"id","title","method","width","dpi"}]
+}
+
+SETTINGS = json.loads(json.dumps(DEFAULT_SETTINGS))
+
+
+def get_settings_path():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "PSD-Batch-Placer", "settings.json")
+
+
+def _clean_rule(r):
+    try:
+        title = str(r.get("title", "")).strip()
+        width = int(r.get("width"))
+        dpi = int(r.get("dpi"))
+        method = r.get("method", DEFAULT_RESAMPLE)
+        if method not in RESAMPLE_METHODS:
+            method = DEFAULT_RESAMPLE
+        if not title or width <= 0 or dpi <= 0:
+            return None
+        return {"id": str(r.get("id", "")).strip(), "title": title,
+                "method": method, "width": width, "dpi": dpi}
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def load_settings():
+    """Reads the settings file into SETTINGS (missing/bad file -> defaults)."""
+    SETTINGS.clear()
+    SETTINGS.update(json.loads(json.dumps(DEFAULT_SETTINGS)))
+    try:
+        with open(get_settings_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data.get("stroke_enabled"), bool):
+            SETTINGS["stroke_enabled"] = data["stroke_enabled"]
+        if isinstance(data.get("keep_json"), bool):
+            SETTINGS["keep_json"] = data["keep_json"]
+        rules = []
+        for r in data.get("resize_rules", []) or []:
+            c = _clean_rule(r)
+            if c:
+                rules.append(c)
+        SETTINGS["resize_rules"] = rules
+    except (OSError, ValueError):
+        pass
+
+
+def save_settings():
+    path = get_settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(SETTINGS, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def normalize_title(s):
+    s = unicodedata.normalize("NFC", s or "")
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
+def clean_page_title(raw):
+    """'AI LOSY - <series name>' -> '<series name>'."""
+    t = re.sub(r"\s+", " ", raw or "").strip()
+    t = re.sub(r"^AI\s*LOSY\s*[-\u2013\u2014:|]\s*", "", t, flags=re.I)
+    t = re.sub(r"\s*[-\u2013\u2014|]\s*AI\s*LOSY$", "", t, flags=re.I)
+    return t.strip()
+
+
+def read_web_title(path):
+    """Series title of a saved HTML/MHTML file, read cheaply from the start
+    of the file (MHTML 'Subject' header, else the <title> tag). '' on failure."""
+    try:
+        is_mht = os.path.splitext(path)[1].lower() in (".mhtml", ".mht")
+        with open(path, "rb") as fh:
+            head = fh.read(65536 if is_mht else 262144)
+        title = ""
+        if is_mht:
+            msg = BytesHeaderParser(policy=email_policy.default).parsebytes(head)
+            title = str(msg.get("Subject") or "")
+            if not title:
+                head = quopri.decodestring(head)
+        if not title:
+            m = re.search(rb"<title[^>]*>(.*?)</title>", head, re.I | re.S)
+            if m:
+                for enc in ("utf-8", "cp949"):
+                    try:
+                        title = m.group(1).decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                title = html_lib.unescape(title)
+        return clean_page_title(title)
+    except Exception:
+        return ""
+
+
+def find_resize_rule(title):
+    """Resize-list entry for a page title: exact (normalized) match first,
+    then an entry whose title is contained in the page title."""
+    nt = normalize_title(title)
+    if not nt:
+        return None
+    rules = SETTINGS.get("resize_rules", [])
+    for r in rules:
+        if normalize_title(r["title"]) == nt:
+            return r
+    for r in rules:
+        rt = normalize_title(r["title"])
+        if len(rt) >= 2 and rt in nt:
+            return r
+    return None
+
+
+def file_matches_resize(f, width, dpi):
+    """True if a scanned file already has the target width and DPI."""
+    d = f.get("dpi")
+    return f.get("width") == width and d is not None and abs(d - dpi) < 0.5
+
+
+load_settings()
 
 
 def round_half_up(x):
@@ -790,7 +989,7 @@ function resizeImageWithScaledStyles(doc, newWidthPx, newHeightPx, dpi, includeI
     // Modern Photoshop identifies resample methods by string ID, not the
     // old 4-char codes (those were retired around when "Preserve Details"
     // upscaling was added) -- 'bilinear' is the current string ID.
-    desc.putEnumerated(charIDToTypeID('Intr'), charIDToTypeID('Intp'), stringIDToTypeID('bilinear'));
+    desc.putEnumerated(charIDToTypeID('Intr'), charIDToTypeID('Intp'), stringIDToTypeID(RESAMPLE_ID));
   }
   executeAction(idImgS, desc, DialogModes.NO);
 }
@@ -1333,6 +1532,9 @@ var RESIZE_W    = %(RESIZE_W)s;
 var RESIZE_DPI  = %(RESIZE_DPI)s;
 var BOX_LIST    = %(BOX_LIST)s;
 var MAKE_BG     = %(MAKE_BG)s;
+var USE_STROKE       = %(USE_STROKE)s;
+var RESAMPLE_ID      = %(RESAMPLE_ID)s;
+var RESAMPLE_DOM     = ResampleMethod.%(RESAMPLE_DOM)s;
 
 // ---- run: resize FIRST (if requested), THEN place text -- a single
 // open/close per file. This is safe because BOX_LIST's ratios were built
@@ -1436,7 +1638,7 @@ try {
           // of the whole run aborting.
           result.errors.push('NOTE: scaled-styles resize could not be made to work on this Photoshop version ("' + resizeErr3.message + '") -- falling back to a plain resize. Layer effect sizes (stroke/glow/shadow) will NOT be scaled for this file.');
           doc.resizeImage(new UnitValue(newW, 'px'), new UnitValue(newH, 'px'),
-                           RESIZE_DPI, ResampleMethod.BILINEAR);
+                           RESIZE_DPI, RESAMPLE_DOM);
         }
       }
     }
@@ -1445,7 +1647,7 @@ try {
   try { enforceVisibility(doc, VIS_SNAPSHOT, result.errors); } catch (eEnf1) {}
 
   var group = null;
-  try { group = doc.layerSets.add(); group.name = %(GROUP_NAME)s; applyStrokeStyle(group, STYLE_SCALE_RATIO); }
+  try { group = doc.layerSets.add(); group.name = %(GROUP_NAME)s; if (USE_STROKE) { applyStrokeStyle(group, STYLE_SCALE_RATIO); } }
   catch (ge) { group = null; }
 
   for (var i = 0; i < BOX_LIST.length; i++) {
@@ -1907,7 +2109,8 @@ def _run_with_dialog_watchdog(ps_app, fn):
             watcher.join(timeout=2)
 
 
-def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, group_name="TR", make_bg=True):
+def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, group_name="TR", make_bg=True,
+                 resize_method=DEFAULT_RESAMPLE):
     """Resize (if requested) and place text -- a single Photoshop open/close for this file.
 
     group_name names the layer group the text boxes are placed into
@@ -1921,6 +2124,10 @@ def run_one_file(ps_app, file_path, box_list, do_resize, resize_w, resize_dpi, g
         "BOX_LIST": json.dumps(box_list),
         "GROUP_NAME": js_string(group_name or "TR"),
         "MAKE_BG": "true" if make_bg else "false",
+        # ---- from Settings ----
+        "USE_STROKE": "true" if SETTINGS.get("stroke_enabled", True) else "false",
+        "RESAMPLE_ID": js_string(RESAMPLE_METHODS.get(resize_method, RESAMPLE_METHODS[DEFAULT_RESAMPLE])[1]),
+        "RESAMPLE_DOM": RESAMPLE_METHODS.get(resize_method, RESAMPLE_METHODS[DEFAULT_RESAMPLE])[2],
     }
     raw = _run_with_dialog_watchdog(ps_app, lambda: ps_app.DoJavaScript(script))
     return parse_result(raw)
@@ -3401,7 +3608,8 @@ def scan_folder(folder):
     for name in image_names:
         path = os.path.join(folder, name)
         dims = read_psd_dimensions(path)
-        files_info.append({"path": path, "name": name, "width": dims["width"], "height": dims["height"]})
+        files_info.append({"path": path, "name": name, "width": dims["width"], "height": dims["height"],
+                           "dpi": read_psd_resolution(path)})
 
     return json_path, files_info, (len(json_names) > 1), html_path, is_mhtml, multiple_html
 
@@ -3457,6 +3665,8 @@ class ChapterRow(ttk.Frame):
         self.html_path = ""
         self.is_mhtml = False
         self.multiple_html = False
+        self.rule = None           # matching resize-list entry (None -> manual fields)
+        self.page_title = ""
 
         self.do_resize = tk.BooleanVar(value=False)
         self.resize_width = tk.StringVar(value="")
@@ -3490,14 +3700,24 @@ class ChapterRow(ttk.Frame):
 
         opts = ttk.Frame(self, style="Card.TFrame")
         opts.pack(fill='x', pady=(8, 0))
-        ttk.Checkbutton(opts, text="Resize (bilinear)", variable=self.do_resize,
-                        style="Card.TCheckbutton", command=self._toggle_resize_fields).pack(side='left')
-        ttk.Label(opts, text="Width (px):", style="Card.TLabel").pack(side='left', padx=(15, 3))
-        self.width_entry = ttk.Entry(opts, textvariable=self.resize_width, width=8, state='disabled')
+        # Resize area: manual fields (only when the series isn't in the
+        # Settings list) OR a read-only line showing the matched parameters.
+        self.resize_box = ttk.Frame(opts, style="Card.TFrame")
+        self.resize_box.pack(side='left')
+        self.manual_frame = ttk.Frame(self.resize_box, style="Card.TFrame")
+        self.manual_frame.pack(side='left')
+        self.resize_check = ttk.Checkbutton(self.manual_frame, text="Resize (bilinear)", variable=self.do_resize,
+                                            style="Card.TCheckbutton", command=self._toggle_resize_fields)
+        self.resize_check.pack(side='left')
+        ttk.Label(self.manual_frame, text="Width (px):", style="Card.TLabel").pack(side='left', padx=(15, 3))
+        self.width_entry = ttk.Entry(self.manual_frame, textvariable=self.resize_width, width=8, state='disabled')
         self.width_entry.pack(side='left')
-        ttk.Label(opts, text="DPI:", style="Card.TLabel").pack(side='left', padx=(15, 3))
-        self.dpi_entry = ttk.Entry(opts, textvariable=self.resize_dpi, width=8, state='disabled')
+        ttk.Label(self.manual_frame, text="DPI:", style="Card.TLabel").pack(side='left', padx=(15, 3))
+        self.dpi_entry = ttk.Entry(self.manual_frame, textvariable=self.resize_dpi, width=8, state='disabled')
         self.dpi_entry.pack(side='left')
+        self.rule_text = tk.StringVar(value="")
+        self.rule_label = ttk.Label(self.resize_box, textvariable=self.rule_text, style="Card.TLabel")
+        # rule_label stays unpacked until a matching list entry is found
         self.bg_check = ttk.Checkbutton(opts, text="Make folder BG", variable=self.make_bg,
                                         style="Card.TCheckbutton")
         self.bg_check.pack(side='left', padx=(40, 0))
@@ -3505,10 +3725,7 @@ class ChapterRow(ttk.Frame):
         # hairline separator under every chapter
         tk.Frame(self, height=1, bg=COLORS["border"]).pack(fill='x', pady=(12, 0))
 
-        self._interactive = [self.choose_btn, self.bg_check]
-        for w in opts.winfo_children():
-            if isinstance(w, ttk.Checkbutton):
-                self._interactive.append(w)
+        self._interactive = [self.choose_btn, self.bg_check, self.resize_check]
 
     # ── small helpers ────────────────────────────────────────────
     def _draw_trash(self, color):
@@ -3537,6 +3754,41 @@ class ChapterRow(ttk.Frame):
         self._toggle_resize_fields()
         if self.trash is not None:
             self.trash.config(cursor="arrow" if locked else "hand2")
+
+    def apply_resize_rule(self):
+        """Looks the saved page's series title up in the Settings resize list.
+        Match -> show the list's parameters (manual fields hidden).
+        No match -> show the manual resize fields, as before. Returns log lines."""
+        title, rule = "", None
+        if self.html_path and os.path.isfile(self.html_path):
+            title = read_web_title(self.html_path)
+            rule = find_resize_rule(title)
+        self.page_title, self.rule = title, rule
+
+        lines = []
+        if rule:
+            n = len(self.files_info or [])
+            need = sum(1 for f in (self.files_info or [])
+                       if not file_matches_resize(f, rule["width"], rule["dpi"]))
+            label = RESAMPLE_METHODS[rule["method"]][0].lower()
+            if n and need == 0:
+                txt = "Resize: %dpx @ %d DPI - already matches, skipped" % (rule["width"], rule["dpi"])
+            else:
+                txt = "Resize: %dpx @ %d DPI (%s) - %d/%d files" % (rule["width"], rule["dpi"], label, need, n)
+            self.rule_text.set(txt)
+            self.manual_frame.pack_forget()
+            self.rule_label.pack(side='left')
+            lines.append("Series title: %s -> matched resize list: %dpx @ %d DPI, %s (%d of %d file(s) need resizing)"
+                         % (title, rule["width"], rule["dpi"], label, need, n))
+        else:
+            self.rule_label.pack_forget()
+            self.manual_frame.pack(side='left')
+            if title:
+                lines.append("Series title: %s -> not in the Settings resize list (use the Resize fields if needed)." % title)
+            elif self.html_path:
+                lines.append("Could not read a series title from the saved file -- use the Resize fields if needed.")
+        self._toggle_resize_fields()
+        return lines
 
     def is_ready(self):
         """Chapter has a folder with PSDs and some translation source."""
@@ -3568,6 +3820,7 @@ class ChapterRow(ttk.Frame):
         self.html_path = path
         self.is_mhtml = path.lower().endswith((".mhtml", ".mht"))
         self._set_html_status()
+        self.owner.log_lines(self.apply_resize_rule())
         self.owner.refresh_summary()
 
     def choose_folder(self):
@@ -3594,10 +3847,13 @@ class ChapterRow(ttk.Frame):
         self.is_mhtml = is_mhtml
         self.multiple_html = multiple_html
         self._set_html_status()
+        rule_lines = self.apply_resize_rule()
 
         log_lines = ["[%s chapter] %s" % (chapter_ordinal(self.owner.index_of(self)), folder)]
         for f in files_info:
-            log_lines.append("  %-40s %dx%d" % (f["name"], f["width"], f["height"]))
+            log_lines.append("  %-40s %dx%d  %s" % (
+                f["name"], f["width"], f["height"],
+                ("%g DPI" % round(f["dpi"], 2)) if f.get("dpi") else "DPI ?"))
         if html_path:
             log_lines.append("Found saved web file: %s%s%s" % (
                 os.path.basename(html_path),
@@ -3618,6 +3874,7 @@ class ChapterRow(ttk.Frame):
                 log_lines.append("Existing JSON found but could not be read: %s" % e)
         elif not html_path:
             log_lines.append("No saved html/mhtml and no textboxes.json in this folder.")
+        log_lines.extend(rule_lines)
         self.owner.log_lines(log_lines)
         self.owner.refresh_summary()
 
@@ -3758,6 +4015,13 @@ class PlacerTab(ttk.Frame):
         self.refresh_summary()
         self.after(10, self._fit_window)
 
+    def refresh_resize_rules(self):
+        """Re-match every chapter against the (possibly edited) resize list."""
+        for r in self.rows:
+            r.apply_resize_rule()
+        self.refresh_summary()
+        self.after(10, self._fit_window)
+
     def refresh_summary(self):
         """Idle state text: single chapter -> file count + JSON; multi -> 'X chapter with trans OK'."""
         if self._running:
@@ -3792,7 +4056,13 @@ class PlacerTab(ttk.Frame):
                 return
 
             resize_width = resize_dpi = None
-            if row.do_resize.get():
+            resize_method = DEFAULT_RESAMPLE
+            if row.rule:
+                # series found in the Settings list -> use its parameters
+                resize_width = row.rule["width"]
+                resize_dpi = row.rule["dpi"]
+                resize_method = row.rule["method"]
+            elif row.do_resize.get():
                 try:
                     resize_width = int(row.resize_width.get())
                     resize_dpi = int(row.resize_dpi.get())
@@ -3823,6 +4093,7 @@ class PlacerTab(ttk.Frame):
                 "files_info": row.files_info, "data": row.data, "json_path": row.json_path,
                 "source": source, "do_extract": do_extract,
                 "resize_width": resize_width, "resize_dpi": resize_dpi,
+                "resize_method": resize_method,
                 "make_bg": row.make_bg.get(),
             })
 
@@ -3840,7 +4111,11 @@ class PlacerTab(ttk.Frame):
             what = "extract %s, " % os.path.basename(j["source"]) if j["do_extract"] else "use existing textboxes.json, "
             what += "%d file(s)" % len(j["files_info"])
             if j["resize_width"]:
-                what += ", resize to %dpx @ %d DPI" % (j["resize_width"], j["resize_dpi"])
+                need = sum(1 for f in j["files_info"]
+                           if not file_matches_resize(f, j["resize_width"], j["resize_dpi"]))
+                what += ", resize to %dpx @ %d DPI (%s) -- %d file(s) need it" % (
+                    j["resize_width"], j["resize_dpi"],
+                    RESAMPLE_METHODS[j["resize_method"]][0].lower(), need)
             confirm_lines.append(("%s: " % j["name"] if multi else "") + what)
         confirm_lines.append("")
         confirm_lines.append("Make sure Photoshop is already OPEN. A Chrome/Edge window will open "
@@ -3893,6 +4168,10 @@ class PlacerTab(ttk.Frame):
         stopped_early = False
         try:
             self.after(0, lambda: self._log("\nPipeline build: %s" % PIPELINE_BUILD))
+            self.after(0, lambda: self._log(
+                "Settings: stroke=%s, keep textboxes.json=%s" % (
+                    "on" if SETTINGS.get("stroke_enabled", True) else "off",
+                    "yes" if SETTINGS.get("keep_json", True) else "no (deleted when done)")))
 
             for job in jobs:
                 if self._stop_event.is_set():
@@ -3906,6 +4185,7 @@ class PlacerTab(ttk.Frame):
                 source = job["source"]
                 resize_width = job["resize_width"]
                 resize_dpi = job["resize_dpi"]
+                resize_method = job["resize_method"]
                 n_files = len(files_info)
                 prefix = (name + ". ") if multi else ""
 
@@ -3964,13 +4244,22 @@ class PlacerTab(ttk.Frame):
                     self.after(0, lambda e=e: self._log("! Cannot build plan: %s -- skipping this chapter." % e))
                     continue
 
-                do_resize = resize_width is not None
+                # Per-file decision: a file that already has the target width AND
+                # DPI is left alone (no resize pass in Photoshop for it).
+                file_resize = [resize_width is not None and
+                               not file_matches_resize(f, resize_width, resize_dpi)
+                               for f in files_info]
                 resolved_dims = compute_resolved_dims(files_info, resize_width)
                 total_boxes = sum(len(b) for b in per_file_boxes)
                 self.after(0, lambda: self._log("=== Plan ==="))
                 for i, f in enumerate(files_info):
                     dim = resolved_dims[i]
-                    note = " (resized to %dx%d)" % (dim["w"], dim["h"]) if do_resize else ""
+                    if file_resize[i]:
+                        note = " (resized to %dx%d)" % (dim["w"], dim["h"])
+                    elif resize_width is not None:
+                        note = " (already %dpx @ %d DPI -- resize skipped)" % (resize_width, resize_dpi)
+                    else:
+                        note = ""
                     n = len(per_file_boxes[i])
                     self.after(0, lambda f=f, n=n, note=note: self._log("  %-40s -> %d text box(es)%s" % (f["name"], n, note)))
                 self.after(0, lambda t=total_boxes, c=n_files: self._log("Total: %d text box(es) across %d file(s).\n" % (t, c)))
@@ -4005,8 +4294,9 @@ class PlacerTab(ttk.Frame):
 
                     box_list = per_file_boxes[i]
                     try:
-                        result = run_one_file(ps_app, f["path"], box_list, do_resize,
-                                              resize_width, resize_dpi, group_name, job["make_bg"])
+                        result = run_one_file(ps_app, f["path"], box_list, file_resize[i],
+                                              resize_width, resize_dpi, group_name, job["make_bg"],
+                                              resize_method=resize_method)
                     except Exception as e:
                         result = {"ok": 0, "total": len(box_list), "errors": [str(e)]}
 
@@ -4017,6 +4307,15 @@ class PlacerTab(ttk.Frame):
                         pfx = "    - " if err.startswith("NOTE:") else "    ! "
                         self.after(0, lambda e=err, p=pfx: self._log(p + e))
                     self.after(0, lambda p=prefix, d=i + 1, c=n_files: self._status("%sWorked %02d/%02d files" % (p, d, c)))
+
+                if (not SETTINGS.get("keep_json", True)) and not stopped_early and json_path:
+                    try:
+                        if os.path.isfile(json_path):
+                            os.remove(json_path)
+                            self.after(0, lambda p=os.path.basename(json_path): self._log(
+                                "Deleted %s (Settings: keep .json is off)." % p))
+                    except OSError as e:
+                        self.after(0, lambda e=e: self._log("! Could not delete the .json file: %s" % e))
 
                 grand_ok += chapter_ok
                 grand_total += total_boxes
@@ -5418,6 +5717,194 @@ class CheckerTab(ttk.Frame):
 #  TOP-LEVEL WINDOW: combines both tools as tabs in one window/exe
 # ══════════════════════════════════════════════════════════════════
 
+class SettingsDialog(tk.Toplevel):
+    """Settings: group stroke, keep/delete textboxes.json, and the
+    per-series resize list (ID, title name, width, DPI -- always bilinear)."""
+
+    def __init__(self, parent, on_saved=None):
+        super().__init__(parent)
+        self.title("Settings")
+        self.configure(bg=COLORS["surface"])
+        self.transient(parent)
+        self.minsize(640, 560)
+        self.on_saved = on_saved
+        self.rules = [dict(r) for r in SETTINGS.get("resize_rules", [])]
+
+        self.var_stroke = tk.BooleanVar(value=bool(SETTINGS.get("stroke_enabled", True)))
+        self.var_keep_json = tk.BooleanVar(value=bool(SETTINGS.get("keep_json", True)))
+
+        self.var_id = tk.StringVar()
+        self.var_title = tk.StringVar()
+        self.var_w = tk.StringVar()
+        self.var_dpi = tk.StringVar()
+
+        # footer first, so it never gets pushed out when the window shrinks
+        footer = ttk.Frame(self, style="Card.TFrame", padding=(16, 8, 16, 14))
+        footer.pack(side='bottom', fill='x')
+        ttk.Button(footer, text="Save", style="Primary.TButton", command=self._save).pack(side='right')
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side='right', padx=(0, 8))
+
+        body = ttk.Frame(self, style="Card.TFrame", padding=(16, 14, 16, 0))
+        body.pack(side='top', fill='both', expand=True)
+
+        # ── Group effect ──
+        box = ttk.LabelFrame(body, text="Group effect", style="Card.TLabelframe", padding=(12, 8))
+        box.pack(fill='x')
+        ttk.Checkbutton(box, text="Add stroke to main group", variable=self.var_stroke,
+                        style="Card.TCheckbutton").pack(anchor='w')
+
+        # ── Delete .json file ──
+        box = ttk.LabelFrame(body, text="Delete .json file", style="Card.TLabelframe", padding=(12, 8))
+        box.pack(fill='x', pady=(10, 0))
+        ttk.Checkbutton(box, text="Keep textboxes.json file when done", variable=self.var_keep_json,
+                        style="Card.TCheckbutton").pack(anchor='w')
+
+        # ── Resize list ──
+        box = ttk.LabelFrame(body, text="Resize list", style="Card.TLabelframe", padding=(12, 8))
+        box.pack(fill='both', expand=True, pady=(10, 0))
+
+        # compact add/edit form: one row of fields, one row of buttons.
+        # Packed at the bottom first so the table above gets all spare height.
+        btns = ttk.Frame(box, style="Card.TFrame")
+        btns.pack(side='bottom', fill='x', pady=(10, 2))
+        ttk.Button(btns, text="Update selected", command=self._update).pack(side='left')
+        ttk.Button(btns, text="Delete selected", command=self._delete).pack(side='left', padx=(8, 0))
+        ttk.Button(btns, text="Add", command=self._add).pack(side='right')
+
+        form = ttk.Frame(box, style="Card.TFrame")
+        form.pack(side='bottom', fill='x', pady=(10, 0))
+        for col, lbl in enumerate(("ID", "Title name", "Width (px)", "DPI")):
+            ttk.Label(form, text=lbl, style="Card.TLabel").grid(
+                row=0, column=col, sticky='w', padx=(0 if col == 0 else 8, 0))
+        ttk.Entry(form, textvariable=self.var_id, width=7).grid(row=1, column=0, sticky='we')
+        ttk.Entry(form, textvariable=self.var_title).grid(row=1, column=1, sticky='we', padx=(8, 0))
+        ttk.Entry(form, textvariable=self.var_w, width=9).grid(row=1, column=2, sticky='we', padx=(8, 0))
+        ttk.Entry(form, textvariable=self.var_dpi, width=7).grid(row=1, column=3, sticky='we', padx=(8, 0))
+        form.columnconfigure(1, weight=1)
+
+        tree_wrap = ttk.Frame(box, style="Card.TFrame")
+        tree_wrap.pack(side='top', fill='both', expand=True)
+        cols = ("id", "title", "width", "dpi")
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=10, selectmode="browse")
+        for c, head, w, anchor in (("id", "ID", 60, "w"), ("title", "Title name", 340, "w"),
+                                   ("width", "Width (px)", 90, "e"), ("dpi", "DPI", 60, "e")):
+            self.tree.heading(c, text=head)
+            self.tree.column(c, width=w, anchor=anchor, stretch=(c == "title"))
+        sb = ttk.Scrollbar(tree_wrap, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self._refresh_tree()
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+            y = parent.winfo_rooty() + 20
+            self.geometry("+%d+%d" % (x, y))
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    # ── list helpers ─────────────────────────────────────────────
+    def _refresh_tree(self, select=None):
+        self.tree.delete(*self.tree.get_children())
+        for i, r in enumerate(self.rules):
+            self.tree.insert("", "end", iid=str(i), values=(r["id"], r["title"], r["width"], r["dpi"]))
+        if select is not None and 0 <= select < len(self.rules):
+            self.tree.selection_set(str(select))
+            self.tree.see(str(select))
+
+    def _selected_index(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
+
+    def _on_select(self, event=None):
+        i = self._selected_index()
+        if i is None:
+            return
+        r = self.rules[i]
+        self.var_id.set(r["id"])
+        self.var_title.set(r["title"])
+        self.var_w.set(str(r["width"]))
+        self.var_dpi.set(str(r["dpi"]))
+
+    def _read_form(self):
+        title = self.var_title.get().strip()
+        if not title:
+            messagebox.showerror("Missing title", "Enter the title name (as shown on the saved page).", parent=self)
+            return None
+        try:
+            width, dpi = int(self.var_w.get()), int(self.var_dpi.get())
+            if width <= 0 or dpi <= 0:
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Invalid input", "Width and DPI must be positive whole numbers.", parent=self)
+            return None
+        return {"id": self.var_id.get().strip(), "title": title, "method": DEFAULT_RESAMPLE,
+                "width": width, "dpi": dpi}
+
+    def _dup_index(self, title, ignore=None):
+        nt = normalize_title(title)
+        for i, r in enumerate(self.rules):
+            if i != ignore and normalize_title(r["title"]) == nt:
+                return i
+        return None
+
+    def _add(self):
+        rule = self._read_form()
+        if not rule:
+            return
+        dup = self._dup_index(rule["title"])
+        if dup is not None:
+            messagebox.showinfo("Already in the list",
+                                "This title is already in the list. Select it and use \"Update selected\".",
+                                parent=self)
+            self._refresh_tree(select=dup)
+            return
+        self.rules.append(rule)
+        self._refresh_tree(select=len(self.rules) - 1)
+
+    def _update(self):
+        i = self._selected_index()
+        if i is None:
+            messagebox.showinfo("Nothing selected", "Select a row in the list first.", parent=self)
+            return
+        rule = self._read_form()
+        if not rule:
+            return
+        if self._dup_index(rule["title"], ignore=i) is not None:
+            messagebox.showerror("Duplicate title", "Another row already uses this title.", parent=self)
+            return
+        self.rules[i] = rule
+        self._refresh_tree(select=i)
+
+    def _delete(self):
+        i = self._selected_index()
+        if i is None:
+            messagebox.showinfo("Nothing selected", "Select a row in the list first.", parent=self)
+            return
+        del self.rules[i]
+        self._refresh_tree(select=min(i, len(self.rules) - 1))
+        for v in (self.var_id, self.var_title, self.var_w, self.var_dpi):
+            v.set("")
+
+    # ── save ─────────────────────────────────────────────────────
+    def _save(self):
+        SETTINGS["stroke_enabled"] = bool(self.var_stroke.get())
+        SETTINGS["keep_json"] = bool(self.var_keep_json.get())
+        SETTINGS["resize_rules"] = [dict(r) for r in self.rules]
+        try:
+            save_settings()
+        except OSError as e:
+            messagebox.showwarning("Could not save to disk",
+                                   "Settings are applied for this session but could not be saved:\n%s" % e,
+                                   parent=self)
+        if self.on_saved:
+            self.on_saved()
+        self.destroy()
+
+
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -5501,7 +5988,7 @@ class MainApp(tk.Tk):
         # Hidden until an update is actually found (see _on_update_found).
         self._update_info = None
 
-        notebook = ttk.Notebook(outer)
+        self.notebook = notebook = ttk.Notebook(outer)
         notebook.pack(fill='both', expand=True)
 
         self.placer_tab = PlacerTab(notebook)
@@ -5510,8 +5997,32 @@ class MainApp(tk.Tk):
         notebook.add(self.placer_tab, text="Batch Text Placer")
         notebook.add(self.checker_tab, text="PSD ↔ Website Checker")
 
+        # Settings button: floats at the top-right, level with the tab strip.
+        self.settings_btn = ttk.Button(outer, text="Settings", style="Toolbar.TButton",
+                                       cursor="hand2", command=self.open_settings)
+        notebook.bind("<Configure>", self._position_settings_btn)
+        notebook.bind("<<NotebookTabChanged>>", self._position_settings_btn)
+        self.after(50, self._position_settings_btn)
+
         # Kiem tra update ngam ngay khi vua mo app, khong lam dung UI.
         self._check_update_on_startup()
+
+    def _position_settings_btn(self, event=None):
+        try:
+            self.update_idletasks()
+            tab_h = self.placer_tab.winfo_y()      # height of the tab strip
+            bh = self.settings_btn.winfo_reqheight()
+            y = max(0, (tab_h - bh) // 2) if tab_h > 0 else 4
+            self.settings_btn.place(in_=self.notebook, relx=1.0, x=-2, y=y, anchor='ne')
+            self.settings_btn.lift()
+        except tk.TclError:
+            pass
+
+    def open_settings(self):
+        if self.placer_tab._running:
+            messagebox.showinfo("Busy", "Wait for the current run to finish before changing settings.")
+            return
+        SettingsDialog(self, on_saved=self.placer_tab.refresh_resize_rules)
 
     # ── Auto-update: check on startup, small corner UI, update on click ──
 
