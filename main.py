@@ -197,18 +197,63 @@ WEB_EXTENSIONS = (".html", ".htm", ".mhtml", ".mht")
 #  THEME  --  white + blue + light gray, applied via ttk.Style
 # ══════════════════════════════════════════════════════════════════
 
-COLORS = {
+LIGHT_COLORS = {
     "bg":          "#F1F4F9",   # app / window background (light gray)
     "surface":     "#FFFFFF",   # card / panel background
     "border":      "#E2E8F2",   # hairline borders on cards & inputs
     "primary":     "#2F6FED",   # main blue (buttons, active states)
-    "primary_dk":  "#255BC7",   # pressed/hover blue
+    "primary_dk":  "#255BC7",   # accent text on pale-blue areas
+    "primary_hover": "#255BC7", # hover/pressed fill of blue buttons
     "primary_lt":  "#EAF1FE",   # pale blue (selected tab / highlight fill)
     "text":        "#1E2530",   # primary text
     "text_muted":  "#6B7686",   # secondary/help text
     "text_on_blue":"#FFFFFF",
     "success":     "#1FA971",
+    "btn_disabled_bg":     "#F3F4F6",
+    "primary_disabled_bg": "#B9C7EA",
+    "primary_disabled_fg": "#F0F3FC",
 }
+
+DARK_COLORS = {
+    "bg":          "#14181F",
+    "surface":     "#1D232C",
+    "border":      "#323B49",
+    "primary":     "#3B76E8",
+    "primary_dk":  "#8DB4FF",
+    "primary_hover": "#2E64CF",
+    "primary_lt":  "#243251",
+    "text":        "#E6EAF2",
+    "text_muted":  "#97A3B6",
+    "text_on_blue":"#FFFFFF",
+    "success":     "#2FBF86",
+    "btn_disabled_bg":     "#262D38",
+    "primary_disabled_bg": "#2A3A5E",
+    "primary_disabled_fg": "#7F8CA6",
+}
+
+# Row colours of the checker table (Tab 2) for each theme.
+LIGHT_ROW_COLORS = {
+    'MATCH': '#d4edda', 'MISMATCH': '#f8d7da', 'MISSING_IN_PSD': '#fff3cd',
+    'MISSING_ON_WEBSITE': '#fff3cd', 'FORMAT_MISMATCH': '#ffe0b3', 'CONVERTED': '#d1ecf1',
+}
+DARK_ROW_COLORS = {
+    'MATCH': '#1F4630', 'MISMATCH': '#5A2530', 'MISSING_IN_PSD': '#574A1C',
+    'MISSING_ON_WEBSITE': '#574A1C', 'FORMAT_MISMATCH': '#5E3E17', 'CONVERTED': '#1D4452',
+}
+
+COLORS = dict(LIGHT_COLORS)   # the live palette; apply_theme() swaps its contents
+
+
+def apply_theme(name):
+    """Switches the live palette (COLORS + checker row colours) in place."""
+    dark = (name == "dark")
+    COLORS.clear()
+    COLORS.update(DARK_COLORS if dark else LIGHT_COLORS)
+    try:
+        CHECKER_ROW_COLORS.clear()
+        CHECKER_ROW_COLORS.update(DARK_ROW_COLORS if dark else LIGHT_ROW_COLORS)
+    except NameError:
+        pass   # table not defined yet (very early call); it is set on first use
 
 
 def setup_style(root):
@@ -256,7 +301,7 @@ def setup_style(root):
     )
     style.map(
         "TButton",
-        background=[("active", COLORS["primary_lt"]), ("disabled", "#F3F4F6")],
+        background=[("active", COLORS["primary_lt"]), ("disabled", COLORS["btn_disabled_bg"])],
         foreground=[("disabled", COLORS["text_muted"])],
     )
 
@@ -266,8 +311,8 @@ def setup_style(root):
     )
     style.map(
         "Primary.TButton",
-        background=[("active", COLORS["primary_dk"]), ("disabled", "#B9C7EA")],
-        foreground=[("disabled", "#F0F3FC")],
+        background=[("active", COLORS["primary_hover"]), ("disabled", COLORS["primary_disabled_bg"])],
+        foreground=[("disabled", COLORS["primary_disabled_fg"])],
     )
 
     style.configure(
@@ -286,18 +331,26 @@ def setup_style(root):
         "TEntry", fieldbackground=COLORS["surface"], background=COLORS["surface"],
         bordercolor=COLORS["border"], foreground=COLORS["text"], padding=6, relief="flat",
     )
-    style.map("TEntry", bordercolor=[("focus", COLORS["primary"])])
+    style.configure("TEntry", insertcolor=COLORS["text"])
+    style.map("TEntry", bordercolor=[("focus", COLORS["primary"])],
+              fieldbackground=[("disabled", COLORS["bg"])],
+              foreground=[("disabled", COLORS["text_muted"])])
 
     style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["text"], font=base_font)
     style.map("TCheckbutton", background=[("active", COLORS["bg"])])
-    style.configure("Card.TCheckbutton", background=COLORS["surface"], foreground=COLORS["text"], font=base_font)
+    style.configure("Card.TCheckbutton", background=COLORS["surface"], foreground=COLORS["text"], font=base_font,
+                    indicatorbackground=COLORS["surface"], indicatorforeground=COLORS["text"])
     style.map("Card.TCheckbutton", background=[("active", COLORS["surface"])])
 
     style.configure("TRadiobutton", background=COLORS["surface"], foreground=COLORS["text"], font=base_font)
     style.map("TRadiobutton", background=[("active", COLORS["surface"])])
 
     # ---- notebook (tabs) ----------------------------------------------------
-    style.configure("TNotebook", background=COLORS["bg"], borderwidth=0, bordercolor=COLORS["bg"])
+    # Frame around the tab content: 1px in the same colour as the hairline
+    # separators (COLORS["border"]); the inner bevel colours blend into the card
+    # so clam can't draw a bright white edge in dark mode.
+    style.configure("TNotebook", background=COLORS["bg"], borderwidth=1, bordercolor=COLORS["border"],
+                    lightcolor=COLORS["surface"], darkcolor=COLORS["surface"])
     style.layout("TNotebook", [("TNotebook.client", {"sticky": "nswe"})])
     style.configure(
         "TNotebook.Tab", background=COLORS["bg"], foreground=COLORS["text_muted"],
@@ -334,7 +387,8 @@ def setup_style(root):
     style.map("Treeview.Heading", background=[("active", COLORS["primary_lt"])])
     style.map("Treeview", background=[("selected", COLORS["primary"])], foreground=[("selected", "#FFFFFF")])
 
-    style.configure("TScrollbar", background=COLORS["bg"], troughcolor=COLORS["bg"], bordercolor=COLORS["bg"])
+    style.configure("TScrollbar", background=COLORS["bg"], troughcolor=COLORS["bg"], bordercolor=COLORS["bg"],
+                    arrowcolor=COLORS["text_muted"], lightcolor=COLORS["bg"], darkcolor=COLORS["bg"])
 
     return style
 
@@ -406,6 +460,7 @@ DEFAULT_RESAMPLE = "bilinear"
 DEFAULT_SETTINGS = {
     "stroke_enabled": True,       # stroke effect on the text group
     "keep_json": True,            # keep textboxes.json after the run
+    "theme": "light",             # "light" | "dark"
     "resize_rules": [],           # [{"id","title","method","width","dpi"}]
 }
 
@@ -449,6 +504,8 @@ def load_settings():
             SETTINGS["stroke_enabled"] = data["stroke_enabled"]
         if isinstance(data.get("keep_json"), bool):
             SETTINGS["keep_json"] = data["keep_json"]
+        if data.get("theme") in ("light", "dark"):
+            SETTINGS["theme"] = data["theme"]
         rules = []
         for r in data.get("resize_rules", []) or []:
             c = _clean_rule(r)
@@ -3723,9 +3780,19 @@ class ChapterRow(ttk.Frame):
         self.bg_check.pack(side='left', padx=(40, 0))
 
         # hairline separator under every chapter
-        tk.Frame(self, height=1, bg=COLORS["border"]).pack(fill='x', pady=(12, 0))
+        self.sep = tk.Frame(self, height=1, bg=COLORS["border"])
+        self.sep.pack(fill='x', pady=(12, 0))
 
         self._interactive = [self.choose_btn, self.bg_check, self.resize_check]
+
+    def restyle(self):
+        """Re-applies the current palette to this row's non-ttk widgets."""
+        self.sep.config(bg=COLORS["border"])
+        if self.trash is not None:
+            self.trash.config(bg=COLORS["surface"])
+            self._draw_trash(self.TRASH_COLOR)
+        if self.html_text.get():
+            self._set_html_status()
 
     # ── small helpers ────────────────────────────────────────────
     def _draw_trash(self, color):
@@ -4014,6 +4081,12 @@ class PlacerTab(ttk.Frame):
         row.destroy()
         self.refresh_summary()
         self.after(10, self._fit_window)
+
+    def restyle(self):
+        self.canvas.config(bg=COLORS["surface"])
+        self.log.config(bg=COLORS["bg"], fg=COLORS["text"], insertbackground=COLORS["text"])
+        for r in self.rows:
+            r.restyle()
 
     def refresh_resize_rules(self):
         """Re-match every chapter against the (possibly edited) resize list."""
@@ -5393,14 +5466,7 @@ def checker_scan_folder(folder):
     return sorted(html_files), sorted(psd_files)
 
 
-CHECKER_ROW_COLORS = {
-    'MATCH': '#d4edda',
-    'MISMATCH': '#f8d7da',
-    'MISSING_IN_PSD': '#fff3cd',
-    'MISSING_ON_WEBSITE': '#fff3cd',
-    'FORMAT_MISMATCH': '#ffe0b3',
-    'CONVERTED': '#d1ecf1',
-}
+CHECKER_ROW_COLORS = dict(LIGHT_ROW_COLORS)   # swapped in place by apply_theme()
 
 STATUS_LABELS = {
     'MATCH': 'Match',
@@ -5545,6 +5611,12 @@ class CheckerTab(ttk.Frame):
         self.tree.pack(side='left', fill='both', expand=True, padx=(10, 0), pady=10)
         vsb.pack(side='right', fill='y', pady=10)
 
+        for status, color in CHECKER_ROW_COLORS.items():
+            self.tree.tag_configure(status, background=color)
+
+    def restyle(self):
+        for key, chip in self.chip_labels.items():
+            chip.config(background=CHECKER_ROW_COLORS[key], foreground=COLORS["text"])
         for status, color in CHECKER_ROW_COLORS.items():
             self.tree.tag_configure(status, background=color)
 
@@ -5726,12 +5798,13 @@ class SettingsDialog(tk.Toplevel):
         self.title("Settings")
         self.configure(bg=COLORS["surface"])
         self.transient(parent)
-        self.minsize(640, 560)
+        self.minsize(640, 620)
         self.on_saved = on_saved
         self.rules = [dict(r) for r in SETTINGS.get("resize_rules", [])]
 
         self.var_stroke = tk.BooleanVar(value=bool(SETTINGS.get("stroke_enabled", True)))
         self.var_keep_json = tk.BooleanVar(value=bool(SETTINGS.get("keep_json", True)))
+        self.var_theme = tk.StringVar(value=SETTINGS.get("theme", "light"))
 
         self.var_id = tk.StringVar()
         self.var_title = tk.StringVar()
@@ -5747,9 +5820,15 @@ class SettingsDialog(tk.Toplevel):
         body = ttk.Frame(self, style="Card.TFrame", padding=(16, 14, 16, 0))
         body.pack(side='top', fill='both', expand=True)
 
+        # ── Theme ──
+        box = ttk.LabelFrame(body, text="Theme", style="Card.TLabelframe", padding=(12, 8))
+        box.pack(fill='x')
+        ttk.Radiobutton(box, text="Light", value="light", variable=self.var_theme).pack(side='left')
+        ttk.Radiobutton(box, text="Dark", value="dark", variable=self.var_theme).pack(side='left', padx=(18, 0))
+
         # ── Group effect ──
         box = ttk.LabelFrame(body, text="Group effect", style="Card.TLabelframe", padding=(12, 8))
-        box.pack(fill='x')
+        box.pack(fill='x', pady=(10, 0))
         ttk.Checkbutton(box, text="Add stroke to main group", variable=self.var_stroke,
                         style="Card.TCheckbutton").pack(anchor='w')
 
@@ -5893,6 +5972,7 @@ class SettingsDialog(tk.Toplevel):
     def _save(self):
         SETTINGS["stroke_enabled"] = bool(self.var_stroke.get())
         SETTINGS["keep_json"] = bool(self.var_keep_json.get())
+        SETTINGS["theme"] = self.var_theme.get()
         SETTINGS["resize_rules"] = [dict(r) for r in self.rules]
         try:
             save_settings()
@@ -5957,6 +6037,8 @@ class MainApp(tk.Tk):
                       f"couldn't load it ({e}) -- make sure it's a valid "
                       f"multi-size .ico file, not a renamed .png.")
 
+        apply_theme(SETTINGS.get("theme", "light"))
+        self._theme_applied = SETTINGS.get("theme", "light")
         setup_style(self)
 
         # Outer light-gray canvas with a little breathing room around the
@@ -5981,7 +6063,7 @@ class MainApp(tk.Tk):
         self.update_btn = tk.Button(
             update_bar, text="Update", font=("Segoe UI", 8),
             bg=COLORS["primary"], fg=COLORS["text_on_blue"],
-            activebackground=COLORS["primary_dk"], activeforeground=COLORS["text_on_blue"],
+            activebackground=COLORS["primary_hover"], activeforeground=COLORS["text_on_blue"],
             relief='flat', bd=0, padx=8, pady=1, cursor="hand2",
             command=self._on_update_button_click,
         )
@@ -6022,7 +6104,26 @@ class MainApp(tk.Tk):
         if self.placer_tab._running:
             messagebox.showinfo("Busy", "Wait for the current run to finish before changing settings.")
             return
-        SettingsDialog(self, on_saved=self.placer_tab.refresh_resize_rules)
+        SettingsDialog(self, on_saved=self._settings_saved)
+
+    def _settings_saved(self):
+        if SETTINGS.get("theme", "light") != self._theme_applied:
+            self._apply_theme_live()
+        self.placer_tab.refresh_resize_rules()
+
+    def _apply_theme_live(self):
+        """Switches light/dark without restarting: ttk styles are re-applied,
+        then the few plain-tk widgets are recoloured by hand."""
+        self._theme_applied = SETTINGS.get("theme", "light")
+        apply_theme(self._theme_applied)
+        setup_style(self)
+        self.update_status_label.config(foreground=COLORS["text_muted"], background=COLORS["bg"])
+        self.update_btn.config(bg=COLORS["primary"], fg=COLORS["text_on_blue"],
+                               activebackground=COLORS["primary_hover"],
+                               activeforeground=COLORS["text_on_blue"])
+        self.placer_tab.restyle()
+        self.checker_tab.restyle()
+        self._position_settings_btn()
 
     # ── Auto-update: check on startup, small corner UI, update on click ──
 
